@@ -545,7 +545,7 @@ async def send_appointment_reminder(
     })
     
     print(f"✅ Reminder sent for appointment {appointment_id} ({hours_until}h)")
-
+#
 
 if __name__ == "__main__":
     import uvicorn
