@@ -274,7 +274,19 @@ def reminder_email(name: str, doctor_name: str, appointment_time: str, hours_unt
 # ENDPOINTS
 # ============================================================================
 
-@app.get("/")
+# @app.get("/")
+# async def root():
+#     """Health check endpoint"""
+#     return {
+#         "status": "healthy",
+#         "service": "TeleMed Backend",
+#         "version": "1.0.0",
+#         "email_provider": "gmail_smtp",
+#         "timestamp": datetime.now(timezone.utc).isoformat()
+#     }
+
+
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     """Health check endpoint"""
     return {
