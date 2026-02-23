@@ -1,4 +1,4 @@
-# SheyDoc App Bachend
+# SheyDoc App Backend
 
 This repository contains the **FastAPI** backend for sheydoc mobile application. It is responsible for sending push notifications, emails, and scheduled reminders when appointments are booked, canceled, or approaching. It uses Firebase Firestore for user/appointment data and Gmail SMTP for emails.
 
