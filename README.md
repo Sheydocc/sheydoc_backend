@@ -1,6 +1,6 @@
-# TeleMed Backend
+# SheyDoc App Bachend
 
-This repository contains the **FastAPI** backend for the TeleMed mobile application. It is responsible for sending push notifications, emails, and scheduled reminders when appointments are booked, canceled, or approaching. It uses Firebase Firestore for user/appointment data and Gmail SMTP for emails.
+This repository contains the **FastAPI** backend for sheydoc mobile application. It is responsible for sending push notifications, emails, and scheduled reminders when appointments are booked, canceled, or approaching. It uses Firebase Firestore for user/appointment data and Gmail SMTP for emails.
 
 ---
 
