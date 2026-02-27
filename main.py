@@ -9,12 +9,12 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 
 import firebase_admin
 from firebase_admin import credentials, firestore, messaging
@@ -93,25 +93,18 @@ class FileUploadResponse(BaseModel):
 def resolve_content_type(file: UploadFile) -> str:
     """
     Reliably determine the content type of an uploaded file.
-    
     Flutter's http package sends 'application/octet-stream' by default.
-    We fix this by checking (in order):
-      1. The content_type sent by the client (if it's not octet-stream)
-      2. The file extension from the filename
-      3. Fall back to 'image/jpeg' (since flutter_image_compress always outputs JPEG)
+    Falls back to guessing from filename extension.
     """
-    # If client sent a real MIME type, trust it
     if file.content_type and file.content_type != "application/octet-stream":
         return file.content_type
 
-    # Try to guess from filename extension
     if file.filename:
         guessed, _ = mimetypes.guess_type(file.filename)
         if guessed:
             print(f"🔍 Guessed MIME type from filename '{file.filename}': {guessed}")
             return guessed
 
-    # Compressed images from flutter_image_compress are always JPEG
     print("⚠️ Could not determine MIME type, defaulting to image/jpeg")
     return "image/jpeg"
 
@@ -174,7 +167,6 @@ def format_datetime(iso_string: str) -> str:
 # FILE UPLOAD FUNCTIONS
 # ============================================================================
 
-# Allowed MIME types
 ALLOWED_TYPES = {
     "image/jpeg", "image/jpg", "image/png", "image/webp", "application/pdf"
 }
@@ -201,17 +193,26 @@ async def upload_to_cloudinary(
         contents = await file.read()
         folder = get_file_category(file_type)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        public_id = f"{folder}/{user_id}_{file_type}_{timestamp}"
+
+        # ✅ public_id must NOT include the folder prefix — Cloudinary
+        # concatenates folder + public_id automatically. Including the
+        # folder in public_id caused a duplicate path in the signature
+        # string which broke signature validation.
+        public_id = f"{user_id}_{file_type}_{timestamp}"
 
         resource_type = "image" if resolved_content_type.startswith("image") else "raw"
 
+        # ✅ CRITICAL FIX: Do NOT pass quality or fetch_format here.
+        # These are delivery/transformation parameters, not upload parameters.
+        # When passed to uploader.upload(), Cloudinary adds a 'transformation'
+        # key to the string-to-sign, which then doesn't match the SDK's
+        # generated signature → "Invalid Signature" error.
+        # Apply these optimizations via Cloudinary Upload Presets instead.
         upload_result = cloudinary.uploader.upload(
             contents,
             public_id=public_id,
             resource_type=resource_type,
             folder=folder,
-            quality="auto" if resource_type == "image" else None,
-            fetch_format="auto" if resource_type == "image" else None,
         )
 
         print(f"✅ Uploaded to Cloudinary: {upload_result['secure_url']}")
@@ -222,7 +223,6 @@ async def upload_to_cloudinary(
             "public_id": upload_result['public_id'],
             "format": upload_result.get('format', ''),
             "size_bytes": upload_result['bytes'],
-            "resource_type": resource_type,
         }
 
     except Exception as e:
@@ -235,16 +235,14 @@ async def upload_to_cloudinary(
 # ============================================================================
 
 def booking_confirmed_email(patient_name: str, doctor_name: str, appointment_time: str) -> str:
-    return f"""
-    <!DOCTYPE html><html><head><style>
+    return f"""<!DOCTYPE html><html><head><style>
         body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
         .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
         .header {{ background: #4A90E2; color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0; }}
         .content {{ background: #f9f9f9; padding: 30px; border-radius: 0 0 8px 8px; }}
         .info-box {{ background: white; padding: 15px; margin: 20px 0; border-left: 4px solid #4A90E2; }}
         .footer {{ text-align: center; padding: 20px; color: #666; font-size: 12px; }}
-    </style></head><body>
-    <div class="container">
+    </style></head><body><div class="container">
         <div class="header"><h1>✅ Appointment Confirmed</h1></div>
         <div class="content">
             <p>Hi {patient_name},</p>
@@ -260,16 +258,14 @@ def booking_confirmed_email(patient_name: str, doctor_name: str, appointment_tim
 
 
 def appointment_canceled_email(name: str, doctor_name: str, appointment_time: str, canceled_by: str) -> str:
-    return f"""
-    <!DOCTYPE html><html><head><style>
+    return f"""<!DOCTYPE html><html><head><style>
         body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
         .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
         .header {{ background: #E74C3C; color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0; }}
         .content {{ background: #f9f9f9; padding: 30px; border-radius: 0 0 8px 8px; }}
         .info-box {{ background: white; padding: 15px; margin: 20px 0; border-left: 4px solid #E74C3C; }}
         .footer {{ text-align: center; padding: 20px; color: #666; font-size: 12px; }}
-    </style></head><body>
-    <div class="container">
+    </style></head><body><div class="container">
         <div class="header"><h1>❌ Appointment Canceled</h1></div>
         <div class="content">
             <p>Hi {name},</p>
@@ -285,8 +281,7 @@ def appointment_canceled_email(name: str, doctor_name: str, appointment_time: st
 
 
 def reminder_email(name: str, doctor_name: str, appointment_time: str, hours_until: int) -> str:
-    return f"""
-    <!DOCTYPE html><html><head><style>
+    return f"""<!DOCTYPE html><html><head><style>
         body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
         .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
         .header {{ background: #F39C12; color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0; }}
@@ -294,8 +289,7 @@ def reminder_email(name: str, doctor_name: str, appointment_time: str, hours_unt
         .info-box {{ background: white; padding: 15px; margin: 20px 0; border-left: 4px solid #F39C12; }}
         .reminder-badge {{ background: #F39C12; color: white; padding: 10px 20px; border-radius: 20px; display: inline-block; margin: 20px 0; font-weight: bold; }}
         .footer {{ text-align: center; padding: 20px; color: #666; font-size: 12px; }}
-    </style></head><body>
-    <div class="container">
+    </style></head><body><div class="container">
         <div class="header"><h1>⏰ Appointment Reminder</h1></div>
         <div class="content">
             <p>Hi {name},</p>
@@ -331,30 +325,21 @@ async def upload_document(
     user_id: str = Form(...),
     file_type: str = Form(...),
 ):
-    """
-    Upload a document/image to Cloudinary.
-    Handles the case where Flutter sends application/octet-stream
-    by detecting the real type from the filename extension.
-    """
     try:
-        # Resolve the real content type (handles octet-stream fallback)
         content_type = resolve_content_type(file)
         print(f"📎 Resolved content type: {content_type} (original: {file.content_type})")
 
-        # Validate resolved type
         if content_type not in ALLOWED_TYPES:
             raise HTTPException(
                 status_code=400,
                 detail=f"File type '{content_type}' not allowed. Use JPG, PNG, WEBP, or PDF."
             )
 
-        # Check file size (max 10MB)
         file.file.seek(0, 2)
         file_size = file.file.tell()
         file.file.seek(0)
 
-        max_size = 10 * 1024 * 1024
-        if file_size > max_size:
+        if file_size > 10 * 1024 * 1024:
             raise HTTPException(
                 status_code=400,
                 detail=f"File too large ({file_size / 1024 / 1024:.1f}MB). Maximum is 10MB."
@@ -471,9 +456,8 @@ async def check_reminders(background_tasks: BackgroundTasks):
         in_24h = now + timedelta(hours=24)
         in_1h = now + timedelta(hours=1)
 
-        appointments_ref = db.collection("appointments")
         upcoming = (
-            appointments_ref
+            db.collection("appointments")
             .where("status", "==", "confirmed")
             .where("appointmentDateTime", ">=", now.isoformat())
             .where("appointmentDateTime", "<=", in_24h.isoformat())
@@ -485,8 +469,9 @@ async def check_reminders(background_tasks: BackgroundTasks):
         for doc in upcoming:
             appointment = doc.to_dict()
             try:
-                apt_time_str = appointment.get("appointmentDateTime")
-                apt_time = datetime.fromisoformat(apt_time_str.replace('Z', '+00:00'))
+                apt_time = datetime.fromisoformat(
+                    appointment.get("appointmentDateTime").replace('Z', '+00:00')
+                )
             except Exception:
                 continue
 
