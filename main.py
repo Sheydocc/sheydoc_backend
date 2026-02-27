@@ -87,54 +87,52 @@ class FileUploadResponse(BaseModel):
 
 
 # ============================================================================
-# HELPER FUNCTIONS
+# HELPERS
 # ============================================================================
 
 def resolve_content_type(file: UploadFile) -> str:
-    """
-    Reliably determine the content type of an uploaded file.
-    Flutter's http package sends 'application/octet-stream' by default.
-    Falls back to guessing from filename extension.
-    """
     if file.content_type and file.content_type != "application/octet-stream":
         return file.content_type
-
     if file.filename:
         guessed, _ = mimetypes.guess_type(file.filename)
         if guessed:
-            print(f"🔍 Guessed MIME type from filename '{file.filename}': {guessed}")
+            print(f"🔍 Guessed MIME from filename '{file.filename}': {guessed}")
             return guessed
-
-    print("⚠️ Could not determine MIME type, defaulting to image/jpeg")
+    print("⚠️ Defaulting MIME type to image/jpeg")
     return "image/jpeg"
+
+
+ALLOWED_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp", "application/pdf"}
+
+FOLDER_MAP = {
+    "education_certificate": "doctors/certificates",
+    "authorization_file": "doctors/authorizations",
+    "affiliate_hospital": "doctors/hospitals",
+    "id_card": "doctors/ids",
+    "profile_photo": "doctors/photos",
+}
 
 
 async def get_user_data(uid: str) -> Optional[Dict[str, Any]]:
     try:
-        user_ref = db.collection("users").document(uid)
-        user_doc = user_ref.get()
-        return user_doc.to_dict() if user_doc.exists else None
+        doc = db.collection("users").document(uid).get()
+        return doc.to_dict() if doc.exists else None
     except Exception as e:
-        print(f"❌ Error fetching user data for {uid}: {e}")
+        print(f"❌ Error fetching user {uid}: {e}")
         return None
 
 
-async def send_fcm_notification(
-    fcm_token: str,
-    title: str,
-    body: str,
-    data: Optional[Dict[str, str]] = None
-):
+async def send_fcm_notification(fcm_token: str, title: str, body: str, data: Optional[Dict[str, str]] = None):
     if not fcm_token:
         return
     try:
-        message = messaging.Message(
+        msg = messaging.Message(
             notification=messaging.Notification(title=title, body=body),
             data=data or {},
             token=fcm_token,
         )
-        response = messaging.send(message)
-        print(f"✅ FCM sent: {response}")
+        messaging.send(msg)
+        print(f"✅ FCM sent to {fcm_token[:20]}...")
     except Exception as e:
         print(f"❌ FCM failed: {e}")
 
@@ -152,7 +150,7 @@ async def send_email(to_email: str, to_name: str, subject: str, html_content: st
             server.send_message(msg)
         print(f"✅ Email sent to {to_email}")
     except Exception as e:
-        print(f"❌ Email failed for {to_email}: {e}")
+        print(f"❌ Email failed: {e}")
 
 
 def format_datetime(iso_string: str) -> str:
@@ -164,24 +162,14 @@ def format_datetime(iso_string: str) -> str:
 
 
 # ============================================================================
-# FILE UPLOAD FUNCTIONS
+# CLOUDINARY UPLOAD
+# The root cause of "Invalid Signature" was passing `folder` as a separate
+# parameter alongside `public_id`. Cloudinary signs `folder` and `public_id`
+# independently, but the SDK generates a signature that doesn't always match
+# this split. The fix: embed the folder directly into `public_id` as a path
+# prefix and do NOT pass `folder` at all. Cloudinary will parse the slashes
+# in public_id as the folder structure automatically.
 # ============================================================================
-
-ALLOWED_TYPES = {
-    "image/jpeg", "image/jpg", "image/png", "image/webp", "application/pdf"
-}
-
-
-def get_file_category(file_type: str) -> str:
-    categories = {
-        "education_certificate": "doctors/certificates",
-        "authorization_file": "doctors/authorizations",
-        "affiliate_hospital": "doctors/hospitals",
-        "id_card": "doctors/ids",
-        "profile_photo": "doctors/photos",
-    }
-    return categories.get(file_type, "doctors/documents")
-
 
 async def upload_to_cloudinary(
     file: UploadFile,
@@ -191,31 +179,26 @@ async def upload_to_cloudinary(
 ) -> Dict[str, Any]:
     try:
         contents = await file.read()
-        folder = get_file_category(file_type)
+        folder = FOLDER_MAP.get(file_type, "doctors/documents")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # ✅ public_id must NOT include the folder prefix — Cloudinary
-        # concatenates folder + public_id automatically. Including the
-        # folder in public_id caused a duplicate path in the signature
-        # string which broke signature validation.
-        public_id = f"{user_id}_{file_type}_{timestamp}"
+        # ✅ Embed folder directly into public_id — do NOT pass folder separately.
+        # When folder is a separate param, Cloudinary signs it independently and
+        # the signature never matches. With the full path in public_id only,
+        # the signed string is simply: public_id=<full_path>&timestamp=<ts>
+        full_public_id = f"{folder}/{user_id}_{file_type}_{timestamp}"
 
         resource_type = "image" if resolved_content_type.startswith("image") else "raw"
 
-        # ✅ CRITICAL FIX: Do NOT pass quality or fetch_format here.
-        # These are delivery/transformation parameters, not upload parameters.
-        # When passed to uploader.upload(), Cloudinary adds a 'transformation'
-        # key to the string-to-sign, which then doesn't match the SDK's
-        # generated signature → "Invalid Signature" error.
-        # Apply these optimizations via Cloudinary Upload Presets instead.
         upload_result = cloudinary.uploader.upload(
             contents,
-            public_id=public_id,
+            public_id=full_public_id,   # e.g. "doctors/certificates/uid_education_certificate_20260227"
             resource_type=resource_type,
-            folder=folder,
+            # NO folder param — folder is encoded in public_id above
+            # NO quality/fetch_format — those cause transformation signature issues
         )
 
-        print(f"✅ Uploaded to Cloudinary: {upload_result['secure_url']}")
+        print(f"✅ Cloudinary upload OK: {upload_result['secure_url']}")
 
         return {
             "success": True,
@@ -236,22 +219,22 @@ async def upload_to_cloudinary(
 
 def booking_confirmed_email(patient_name: str, doctor_name: str, appointment_time: str) -> str:
     return f"""<!DOCTYPE html><html><head><style>
-        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-        .header {{ background: #4A90E2; color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0; }}
-        .content {{ background: #f9f9f9; padding: 30px; border-radius: 0 0 8px 8px; }}
-        .info-box {{ background: white; padding: 15px; margin: 20px 0; border-left: 4px solid #4A90E2; }}
-        .footer {{ text-align: center; padding: 20px; color: #666; font-size: 12px; }}
+        body{{font-family:Arial,sans-serif;line-height:1.6;color:#333}}
+        .container{{max-width:600px;margin:0 auto;padding:20px}}
+        .header{{background:#4A90E2;color:white;padding:20px;text-align:center;border-radius:8px 8px 0 0}}
+        .content{{background:#f9f9f9;padding:30px;border-radius:0 0 8px 8px}}
+        .info-box{{background:white;padding:15px;margin:20px 0;border-left:4px solid #4A90E2}}
+        .footer{{text-align:center;padding:20px;color:#666;font-size:12px}}
     </style></head><body><div class="container">
         <div class="header"><h1>✅ Appointment Confirmed</h1></div>
         <div class="content">
             <p>Hi {patient_name},</p>
             <p>Your telemedicine appointment has been confirmed.</p>
             <div class="info-box">
-                <p><strong>👨‍⚕️ Doctor:</strong> Dr. {doctor_name}</p>
-                <p><strong>📅 Date &amp; Time:</strong> {appointment_time}</p>
+                <p><strong>Doctor:</strong> Dr. {doctor_name}</p>
+                <p><strong>Date &amp; Time:</strong> {appointment_time}</p>
             </div>
-            <p>Please be ready to join the video call a few minutes before the scheduled time.</p>
+            <p>Please be ready a few minutes before the scheduled time.</p>
         </div>
         <div class="footer"><p>TeleMed - Your Health, Our Priority</p></div>
     </div></body></html>"""
@@ -259,22 +242,22 @@ def booking_confirmed_email(patient_name: str, doctor_name: str, appointment_tim
 
 def appointment_canceled_email(name: str, doctor_name: str, appointment_time: str, canceled_by: str) -> str:
     return f"""<!DOCTYPE html><html><head><style>
-        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-        .header {{ background: #E74C3C; color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0; }}
-        .content {{ background: #f9f9f9; padding: 30px; border-radius: 0 0 8px 8px; }}
-        .info-box {{ background: white; padding: 15px; margin: 20px 0; border-left: 4px solid #E74C3C; }}
-        .footer {{ text-align: center; padding: 20px; color: #666; font-size: 12px; }}
+        body{{font-family:Arial,sans-serif;line-height:1.6;color:#333}}
+        .container{{max-width:600px;margin:0 auto;padding:20px}}
+        .header{{background:#E74C3C;color:white;padding:20px;text-align:center;border-radius:8px 8px 0 0}}
+        .content{{background:#f9f9f9;padding:30px;border-radius:0 0 8px 8px}}
+        .info-box{{background:white;padding:15px;margin:20px 0;border-left:4px solid #E74C3C}}
+        .footer{{text-align:center;padding:20px;color:#666;font-size:12px}}
     </style></head><body><div class="container">
         <div class="header"><h1>❌ Appointment Canceled</h1></div>
         <div class="content">
             <p>Hi {name},</p>
-            <p>Your appointment has been canceled by the {canceled_by}.</p>
+            <p>Your appointment was canceled by the {canceled_by}.</p>
             <div class="info-box">
-                <p><strong>👨‍⚕️ Doctor:</strong> Dr. {doctor_name}</p>
-                <p><strong>📅 Original Date &amp; Time:</strong> {appointment_time}</p>
+                <p><strong>Doctor:</strong> Dr. {doctor_name}</p>
+                <p><strong>Original Date &amp; Time:</strong> {appointment_time}</p>
             </div>
-            <p>You can book a new appointment anytime through the app.</p>
+            <p>You can rebook anytime through the app.</p>
         </div>
         <div class="footer"><p>TeleMed - Your Health, Our Priority</p></div>
     </div></body></html>"""
@@ -282,22 +265,21 @@ def appointment_canceled_email(name: str, doctor_name: str, appointment_time: st
 
 def reminder_email(name: str, doctor_name: str, appointment_time: str, hours_until: int) -> str:
     return f"""<!DOCTYPE html><html><head><style>
-        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-        .header {{ background: #F39C12; color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0; }}
-        .content {{ background: #f9f9f9; padding: 30px; border-radius: 0 0 8px 8px; }}
-        .info-box {{ background: white; padding: 15px; margin: 20px 0; border-left: 4px solid #F39C12; }}
-        .reminder-badge {{ background: #F39C12; color: white; padding: 10px 20px; border-radius: 20px; display: inline-block; margin: 20px 0; font-weight: bold; }}
-        .footer {{ text-align: center; padding: 20px; color: #666; font-size: 12px; }}
+        body{{font-family:Arial,sans-serif;line-height:1.6;color:#333}}
+        .container{{max-width:600px;margin:0 auto;padding:20px}}
+        .header{{background:#F39C12;color:white;padding:20px;text-align:center;border-radius:8px 8px 0 0}}
+        .content{{background:#f9f9f9;padding:30px;border-radius:0 0 8px 8px}}
+        .info-box{{background:white;padding:15px;margin:20px 0;border-left:4px solid #F39C12}}
+        .badge{{background:#F39C12;color:white;padding:10px 20px;border-radius:20px;display:inline-block;margin:20px 0;font-weight:bold}}
+        .footer{{text-align:center;padding:20px;color:#666;font-size:12px}}
     </style></head><body><div class="container">
         <div class="header"><h1>⏰ Appointment Reminder</h1></div>
         <div class="content">
             <p>Hi {name},</p>
-            <p>Friendly reminder about your upcoming appointment.</p>
-            <div style="text-align:center;"><span class="reminder-badge">In {hours_until} hour(s)</span></div>
+            <div style="text-align:center"><span class="badge">In {hours_until} hour(s)</span></div>
             <div class="info-box">
-                <p><strong>👨‍⚕️ Doctor:</strong> Dr. {doctor_name}</p>
-                <p><strong>📅 Date &amp; Time:</strong> {appointment_time}</p>
+                <p><strong>Doctor:</strong> Dr. {doctor_name}</p>
+                <p><strong>Date &amp; Time:</strong> {appointment_time}</p>
             </div>
         </div>
         <div class="footer"><p>TeleMed - Your Health, Our Priority</p></div>
@@ -370,40 +352,34 @@ async def booking_confirmed(request: BookingConfirmedRequest, background_tasks: 
     try:
         patient_data = await get_user_data(request.patient_id)
         doctor_data = await get_user_data(request.doctor_id)
-
         if not patient_data or not doctor_data:
             raise HTTPException(status_code=404, detail="User not found")
 
         patient_name = patient_data.get("displayName") or patient_data.get("firstName", "Patient")
         doctor_name = doctor_data.get("displayName") or doctor_data.get("firstName", "Doctor")
-        appointment_time = format_datetime(request.appointment_datetime)
+        apt_time = format_datetime(request.appointment_datetime)
 
-        if patient_fcm := patient_data.get("fcmToken"):
-            background_tasks.add_task(send_fcm_notification, patient_fcm,
-                "Appointment Confirmed ✅",
-                f"Your appointment with Dr. {doctor_name} is confirmed for {appointment_time}",
+        if fcm := patient_data.get("fcmToken"):
+            background_tasks.add_task(send_fcm_notification, fcm, "Appointment Confirmed ✅",
+                f"Your appointment with Dr. {doctor_name} is confirmed for {apt_time}",
                 {"type": "booking_confirmed", "appointment_id": request.appointment_id})
 
-        if doctor_fcm := doctor_data.get("fcmToken"):
-            background_tasks.add_task(send_fcm_notification, doctor_fcm,
-                "New Appointment 📅",
-                f"New appointment with {patient_name} scheduled for {appointment_time}",
+        if fcm := doctor_data.get("fcmToken"):
+            background_tasks.add_task(send_fcm_notification, fcm, "New Appointment 📅",
+                f"New appointment with {patient_name} for {apt_time}",
                 {"type": "booking_confirmed", "appointment_id": request.appointment_id})
 
-        if patient_email := patient_data.get("email"):
-            background_tasks.add_task(send_email, patient_email, patient_name,
-                "Appointment Confirmed",
-                booking_confirmed_email(patient_name, doctor_name, appointment_time))
+        if email := patient_data.get("email"):
+            background_tasks.add_task(send_email, email, patient_name, "Appointment Confirmed",
+                booking_confirmed_email(patient_name, doctor_name, apt_time))
 
-        if doctor_email := doctor_data.get("email"):
-            background_tasks.add_task(send_email, doctor_email, doctor_name,
-                "New Appointment Scheduled",
-                booking_confirmed_email(doctor_name, patient_name, appointment_time))
+        if email := doctor_data.get("email"):
+            background_tasks.add_task(send_email, email, doctor_name, "New Appointment Scheduled",
+                booking_confirmed_email(doctor_name, patient_name, apt_time))
 
-        return {"success": True, "message": "Notifications sent", "patient": patient_name, "doctor": doctor_name}
+        return {"success": True, "message": "Notifications sent"}
 
     except Exception as e:
-        print(f"❌ Error in booking_confirmed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -412,40 +388,34 @@ async def appointment_canceled(request: AppointmentCanceledRequest, background_t
     try:
         patient_data = await get_user_data(request.patient_id)
         doctor_data = await get_user_data(request.doctor_id)
-
         if not patient_data or not doctor_data:
             raise HTTPException(status_code=404, detail="User not found")
 
         patient_name = patient_data.get("displayName") or patient_data.get("firstName", "Patient")
         doctor_name = doctor_data.get("displayName") or doctor_data.get("firstName", "Doctor")
-        appointment_time = format_datetime(request.appointment_datetime)
+        apt_time = format_datetime(request.appointment_datetime)
 
-        if patient_fcm := patient_data.get("fcmToken"):
-            background_tasks.add_task(send_fcm_notification, patient_fcm,
-                "Appointment Canceled ❌",
-                f"Your appointment with Dr. {doctor_name} on {appointment_time} has been canceled",
+        if fcm := patient_data.get("fcmToken"):
+            background_tasks.add_task(send_fcm_notification, fcm, "Appointment Canceled ❌",
+                f"Your appointment with Dr. {doctor_name} on {apt_time} was canceled",
                 {"type": "appointment_canceled", "appointment_id": request.appointment_id})
 
-        if doctor_fcm := doctor_data.get("fcmToken"):
-            background_tasks.add_task(send_fcm_notification, doctor_fcm,
-                "Appointment Canceled ❌",
-                f"Appointment with {patient_name} on {appointment_time} has been canceled",
+        if fcm := doctor_data.get("fcmToken"):
+            background_tasks.add_task(send_fcm_notification, fcm, "Appointment Canceled ❌",
+                f"Appointment with {patient_name} on {apt_time} was canceled",
                 {"type": "appointment_canceled", "appointment_id": request.appointment_id})
 
-        if patient_email := patient_data.get("email"):
-            background_tasks.add_task(send_email, patient_email, patient_name,
-                "Appointment Canceled",
-                appointment_canceled_email(patient_name, doctor_name, appointment_time, request.canceled_by))
+        if email := patient_data.get("email"):
+            background_tasks.add_task(send_email, email, patient_name, "Appointment Canceled",
+                appointment_canceled_email(patient_name, doctor_name, apt_time, request.canceled_by))
 
-        if doctor_email := doctor_data.get("email"):
-            background_tasks.add_task(send_email, doctor_email, doctor_name,
-                "Appointment Canceled",
-                appointment_canceled_email(doctor_name, patient_name, appointment_time, request.canceled_by))
+        if email := doctor_data.get("email"):
+            background_tasks.add_task(send_email, email, doctor_name, "Appointment Canceled",
+                appointment_canceled_email(doctor_name, patient_name, apt_time, request.canceled_by))
 
-        return {"success": True, "message": "Cancellation notifications sent", "canceled_by": request.canceled_by}
+        return {"success": True, "message": "Cancellation notifications sent"}
 
     except Exception as e:
-        print(f"❌ Error in appointment_canceled: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -465,73 +435,59 @@ async def check_reminders(background_tasks: BackgroundTasks):
         )
 
         reminders_sent = 0
-
         for doc in upcoming:
             appointment = doc.to_dict()
             try:
                 apt_time = datetime.fromisoformat(
-                    appointment.get("appointmentDateTime").replace('Z', '+00:00')
-                )
+                    appointment.get("appointmentDateTime").replace('Z', '+00:00'))
             except Exception:
                 continue
 
-            last_reminder = appointment.get("lastReminderSent")
-
-            if now <= apt_time <= in_24h and apt_time > in_1h and not last_reminder:
+            last = appointment.get("lastReminderSent")
+            if now <= apt_time <= in_24h and apt_time > in_1h and not last:
                 await send_appointment_reminder(appointment, doc.id, 24, background_tasks)
                 reminders_sent += 1
-
-            if now <= apt_time <= in_1h and last_reminder != "1h":
+            if now <= apt_time <= in_1h and last != "1h":
                 await send_appointment_reminder(appointment, doc.id, 1, background_tasks)
                 reminders_sent += 1
 
         return {"success": True, "reminders_sent": reminders_sent, "checked_at": now.isoformat()}
 
     except Exception as e:
-        print(f"❌ Error in check_reminders: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def send_appointment_reminder(
-    appointment: Dict[str, Any],
-    appointment_id: str,
-    hours_until: int,
-    background_tasks: BackgroundTasks
-):
+async def send_appointment_reminder(appointment, appointment_id, hours_until, background_tasks):
     patient_data = await get_user_data(appointment.get("patientId"))
     doctor_data = await get_user_data(appointment.get("doctorId"))
-
     if not patient_data or not doctor_data:
         return
 
     patient_name = patient_data.get("displayName") or patient_data.get("firstName", "Patient")
     doctor_name = doctor_data.get("displayName") or doctor_data.get("firstName", "Doctor")
-    appointment_time = format_datetime(appointment.get("appointmentDateTime"))
+    apt_time = format_datetime(appointment.get("appointmentDateTime"))
     title = f"⏰ Appointment in {hours_until}h"
 
-    if patient_fcm := patient_data.get("fcmToken"):
-        background_tasks.add_task(send_fcm_notification, patient_fcm, title,
-            f"Reminder: Appointment with Dr. {doctor_name} at {appointment_time}",
+    if fcm := patient_data.get("fcmToken"):
+        background_tasks.add_task(send_fcm_notification, fcm, title,
+            f"Reminder: Appointment with Dr. {doctor_name} at {apt_time}",
             {"type": "reminder", "appointment_id": appointment_id})
-
-    if patient_email := patient_data.get("email"):
-        background_tasks.add_task(send_email, patient_email, patient_name,
+    if email := patient_data.get("email"):
+        background_tasks.add_task(send_email, email, patient_name,
             f"Appointment Reminder - {hours_until}h",
-            reminder_email(patient_name, doctor_name, appointment_time, hours_until))
-
-    if doctor_fcm := doctor_data.get("fcmToken"):
-        background_tasks.add_task(send_fcm_notification, doctor_fcm, title,
-            f"Reminder: Appointment with {patient_name} at {appointment_time}",
+            reminder_email(patient_name, doctor_name, apt_time, hours_until))
+    if fcm := doctor_data.get("fcmToken"):
+        background_tasks.add_task(send_fcm_notification, fcm, title,
+            f"Reminder: Appointment with {patient_name} at {apt_time}",
             {"type": "reminder", "appointment_id": appointment_id})
-
-    if doctor_email := doctor_data.get("email"):
-        background_tasks.add_task(send_email, doctor_email, doctor_name,
+    if email := doctor_data.get("email"):
+        background_tasks.add_task(send_email, email, doctor_name,
             f"Appointment Reminder - {hours_until}h",
-            reminder_email(doctor_name, patient_name, appointment_time, hours_until))
+            reminder_email(doctor_name, patient_name, apt_time, hours_until))
 
     reminder_key = "1h" if hours_until == 1 else "24h"
     db.collection("appointments").document(appointment_id).update({"lastReminderSent": reminder_key})
-    print(f"✅ Reminder sent for appointment {appointment_id} ({hours_until}h)")
+    print(f"✅ Reminder sent for {appointment_id} ({hours_until}h)")
 
 
 if __name__ == "__main__":
