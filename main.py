@@ -1,22 +1,18 @@
 
-
 """
 TeleMed FastAPI Backend
-File storage: Backblaze B2 (S3-compatible, no signature headaches)
+Handles notifications, emails, scheduled reminders, AND file uploads via Appwrite
 """
 
 import os
 import mimetypes
 import smtplib
-import uuid
+import tempfile
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
-
-import boto3
-from botocore.client import Config
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +20,12 @@ from pydantic import BaseModel
 
 import firebase_admin
 from firebase_admin import credentials, firestore, messaging
+
+# Appwrite SDK
+from appwrite.client import Client
+from appwrite.services.storage import Storage
+from appwrite.input_file import InputFile
+from appwrite.id import ID
 
 load_dotenv()
 
@@ -37,30 +39,22 @@ SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 FROM_NAME = os.getenv("FROM_NAME", "TeleMed App")
 
-# Backblaze B2 credentials — add these to your Render environment variables:
-# B2_KEY_ID        → your Backblaze Application Key ID
-# B2_APPLICATION_KEY → your Backblaze Application Key
-# B2_BUCKET_NAME   → your bucket name (e.g. "sheydoc-documents")
-# B2_BUCKET_REGION → your bucket region (e.g. "us-west-004")
-#
-# Backblaze endpoint format: https://s3.<region>.backblazeb2.com
-B2_KEY_ID = os.getenv("B2_KEY_ID")
-B2_APPLICATION_KEY = os.getenv("B2_APPLICATION_KEY")
-B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME")
-B2_BUCKET_REGION = os.getenv("B2_BUCKET_REGION", "us-west-004")
-B2_ENDPOINT = f"https://s3.{B2_BUCKET_REGION}.backblazeb2.com"
+# Appwrite config — set these in Render environment variables
+APPWRITE_ENDPOINT   = os.getenv("APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1")
+APPWRITE_PROJECT_ID = os.getenv("APPWRITE_PROJECT_ID")   # from Appwrite console
+APPWRITE_API_KEY    = os.getenv("APPWRITE_API_KEY")       # Server API key
+APPWRITE_BUCKET_ID  = os.getenv("APPWRITE_BUCKET_ID")     # Storage bucket ID
 
-# Build the boto3 S3 client pointed at Backblaze
-s3 = boto3.client(
-    service_name="s3",
-    endpoint_url=B2_ENDPOINT,
-    aws_access_key_id=B2_KEY_ID,
-    aws_secret_access_key=B2_APPLICATION_KEY,
-    config=Config(signature_version="s3v4"),
-)
+# Build Appwrite client
+appwrite_client = Client()
+appwrite_client.set_endpoint(APPWRITE_ENDPOINT)
+appwrite_client.set_project(APPWRITE_PROJECT_ID)
+appwrite_client.set_key(APPWRITE_API_KEY)
+
+appwrite_storage = Storage(appwrite_client)
 
 # ============================================================================
-# APP SETUP
+# FASTAPI APP
 # ============================================================================
 
 app = FastAPI(
@@ -77,6 +71,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Firebase
 cred = credentials.Certificate(os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH"))
 firebase_admin.initialize_app(cred)
 db = firestore.client()
@@ -105,28 +100,20 @@ class AppointmentCanceledRequest(BaseModel):
 class FileUploadResponse(BaseModel):
     success: bool
     url: str
-    file_key: str
-    size_bytes: int
+    file_id: str
     message: str
 
 
 # ============================================================================
-# FILE UPLOAD — BACKBLAZE B2
+# FILE UPLOAD — APPWRITE
+# No signatures, no credentials in requests, just works.
 # ============================================================================
 
 ALLOWED_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp", "application/pdf"}
 
-FOLDER_MAP = {
-    "education_certificate": "doctors/certificates",
-    "authorization_file":    "doctors/authorizations",
-    "affiliate_hospital":    "doctors/hospitals",
-    "id_card":               "doctors/ids",
-    "profile_photo":         "doctors/photos",
-}
-
 
 def resolve_content_type(file: UploadFile) -> str:
-    """Determine real MIME type — handles Flutter's octet-stream default."""
+    """Detect real MIME type — Flutter sends octet-stream by default."""
     if file.content_type and file.content_type != "application/octet-stream":
         return file.content_type
     if file.filename:
@@ -134,66 +121,84 @@ def resolve_content_type(file: UploadFile) -> str:
         if guessed:
             print(f"🔍 Guessed MIME from '{file.filename}': {guessed}")
             return guessed
+    print("⚠️ Defaulting MIME to image/jpeg")
     return "image/jpeg"
 
 
-async def upload_to_b2(
+def build_appwrite_view_url(file_id: str) -> str:
+    """
+    Build a direct public view URL for the uploaded file.
+    Requires the bucket to have 'File Security' disabled OR the file to be public.
+    """
+    return (
+        f"{APPWRITE_ENDPOINT}/storage/buckets/{APPWRITE_BUCKET_ID}"
+        f"/files/{file_id}/view?project={APPWRITE_PROJECT_ID}"
+    )
+
+
+async def upload_to_appwrite(
     file: UploadFile,
     user_id: str,
     file_type: str,
     content_type: str,
 ) -> Dict[str, Any]:
     """
-    Upload file to Backblaze B2 using boto3 S3-compatible API.
-    No manual signature generation — boto3 handles everything.
+    Upload file to Appwrite Storage.
+    Appwrite requires a real file path (not a stream) so we write to a temp file first.
     """
     contents = await file.read()
-    file_size = len(contents)
 
-    folder = FOLDER_MAP.get(file_type, "doctors/documents")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    unique_id = uuid.uuid4().hex[:8]
-
-    # Determine file extension from content type
+    # Determine extension from content type
     ext_map = {
         "image/jpeg": ".jpg",
-        "image/jpg":  ".jpg",
-        "image/png":  ".png",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
         "image/webp": ".webp",
         "application/pdf": ".pdf",
     }
     ext = ext_map.get(content_type, ".jpg")
 
-    # Final key (path) in the bucket
-    file_key = f"{folder}/{user_id}_{file_type}_{timestamp}_{unique_id}{ext}"
+    # Write to temp file — Appwrite SDK needs a file path
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        tmp.write(contents)
+        tmp_path = tmp.name
 
-    print(f"📤 Uploading to B2: {file_key} ({file_size / 1024:.1f}KB) [{content_type}]")
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Use a meaningful filename so it's identifiable in Appwrite console
+        filename = f"{user_id}_{file_type}_{timestamp}{ext}"
 
-    # Simple put_object — boto3 handles signing automatically
-    s3.put_object(
-        Bucket=B2_BUCKET_NAME,
-        Key=file_key,
-        Body=contents,
-        ContentType=content_type,
-        # Make file publicly readable
-        ACL="public-read",
-    )
+        # Upload — ID.unique() generates a unique Appwrite file ID automatically
+        result = appwrite_storage.create_file(
+            bucket_id=APPWRITE_BUCKET_ID,
+            file_id=ID.unique(),
+            file=InputFile.from_path(tmp_path, filename=filename),
+        )
 
-    # Public URL format for Backblaze B2
-    public_url = f"{B2_ENDPOINT}/{B2_BUCKET_NAME}/{file_key}"
+        file_id = result['$id']
+        url = build_appwrite_view_url(file_id)
 
-    print(f"✅ B2 upload OK: {public_url}")
+        print(f"✅ Appwrite upload OK — file_id: {file_id}")
+        print(f"   URL: {url}")
 
-    return {
-        "success": True,
-        "url": public_url,
-        "file_key": file_key,
-        "size_bytes": file_size,
-    }
+        return {
+            "success": True,
+            "file_id": file_id,
+            "url": url,
+        }
+
+    except Exception as e:
+        print(f"❌ Appwrite upload failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+    finally:
+        # Always clean up temp file
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 # ============================================================================
-# FIREBASE HELPERS
+# FIREBASE / EMAIL HELPERS
 # ============================================================================
 
 async def get_user_data(uid: str) -> Optional[Dict[str, Any]]:
@@ -206,7 +211,9 @@ async def get_user_data(uid: str) -> Optional[Dict[str, Any]]:
 
 
 async def send_fcm_notification(
-    fcm_token: str, title: str, body: str,
+    fcm_token: str,
+    title: str,
+    body: str,
     data: Optional[Dict[str, str]] = None
 ):
     if not fcm_token:
@@ -330,7 +337,7 @@ async def root():
         "status": "healthy",
         "service": "TeleMed Backend",
         "version": "3.0.0",
-        "file_storage": "backblaze_b2",
+        "file_storage": "appwrite",
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
@@ -341,6 +348,7 @@ async def upload_document(
     user_id: str = Form(...),
     file_type: str = Form(...),
 ):
+    """Upload a document or image to Appwrite Storage."""
     try:
         content_type = resolve_content_type(file)
         print(f"📎 Content type: {content_type} (raw: {file.content_type})")
@@ -351,7 +359,7 @@ async def upload_document(
                 detail=f"File type '{content_type}' not allowed. Use JPG, PNG, WEBP, or PDF."
             )
 
-        # Check size before reading full file
+        # Check file size (max 10MB)
         file.file.seek(0, 2)
         file_size = file.file.tell()
         file.file.seek(0)
@@ -362,13 +370,14 @@ async def upload_document(
                 detail=f"File too large ({file_size / 1024 / 1024:.1f}MB). Max is 10MB."
             )
 
-        result = await upload_to_b2(file, user_id, file_type, content_type)
+        print(f"📤 Uploading {file_type} for {user_id}: {file.filename} ({file_size / 1024:.1f}KB)")
+
+        result = await upload_to_appwrite(file, user_id, file_type, content_type)
 
         return FileUploadResponse(
             success=True,
-            url=result["url"],
-            file_key=result["file_key"],
-            size_bytes=result["size_bytes"],
+            url=result['url'],
+            file_id=result['file_id'],
             message="File uploaded successfully"
         )
 
@@ -434,7 +443,7 @@ async def appointment_canceled(request: AppointmentCanceledRequest, background_t
         if fcm := patient_data.get("fcmToken"):
             background_tasks.add_task(send_fcm_notification, fcm,
                 "Appointment Canceled ❌",
-                f"Appointment with Dr. {doctor_name} on {apt_time} was canceled",
+                f"Your appointment with Dr. {doctor_name} on {apt_time} was canceled",
                 {"type": "appointment_canceled", "appointment_id": request.appointment_id})
 
         if fcm := doctor_data.get("fcmToken"):
@@ -533,6 +542,539 @@ async def send_appointment_reminder(appointment, appointment_id, hours_until, ba
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+# """
+# TeleMed FastAPI Backend
+# File storage: Backblaze B2 (S3-compatible, no signature headaches)
+# """
+
+# import os
+# import mimetypes
+# import smtplib
+# import uuid
+# from email.mime.text import MIMEText
+# from email.mime.multipart import MIMEMultipart
+# from datetime import datetime, timedelta, timezone
+# from typing import Optional, Dict, Any
+# from dotenv import load_dotenv
+
+# import boto3
+# from botocore.client import Config
+
+# from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
+# from fastapi.middleware.cors import CORSMiddleware
+# from pydantic import BaseModel
+
+# import firebase_admin
+# from firebase_admin import credentials, firestore, messaging
+
+# load_dotenv()
+
+# # ============================================================================
+# # CONFIG
+# # ============================================================================
+
+# SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+# SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+# SMTP_USER = os.getenv("SMTP_USER")
+# SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+# FROM_NAME = os.getenv("FROM_NAME", "TeleMed App")
+
+# # Backblaze B2 credentials — add these to your Render environment variables:
+# # B2_KEY_ID        → your Backblaze Application Key ID
+# # B2_APPLICATION_KEY → your Backblaze Application Key
+# # B2_BUCKET_NAME   → your bucket name (e.g. "sheydoc-documents")
+# # B2_BUCKET_REGION → your bucket region (e.g. "us-west-004")
+# #
+# # Backblaze endpoint format: https://s3.<region>.backblazeb2.com
+# B2_KEY_ID = os.getenv("B2_KEY_ID")
+# B2_APPLICATION_KEY = os.getenv("B2_APPLICATION_KEY")
+# B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME")
+# B2_BUCKET_REGION = os.getenv("B2_BUCKET_REGION", "us-west-004")
+# B2_ENDPOINT = f"https://s3.{B2_BUCKET_REGION}.backblazeb2.com"
+
+# # Build the boto3 S3 client pointed at Backblaze
+# s3 = boto3.client(
+#     service_name="s3",
+#     endpoint_url=B2_ENDPOINT,
+#     aws_access_key_id=B2_KEY_ID,
+#     aws_secret_access_key=B2_APPLICATION_KEY,
+#     config=Config(signature_version="s3v4"),
+# )
+
+# # ============================================================================
+# # APP SETUP
+# # ============================================================================
+
+# app = FastAPI(
+#     title="TeleMed Backend",
+#     description="Notification, email, and file upload service for TeleMed app",
+#     version="3.0.0"
+# )
+
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+# cred = credentials.Certificate(os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH"))
+# firebase_admin.initialize_app(cred)
+# db = firestore.client()
+
+
+# # ============================================================================
+# # PYDANTIC MODELS
+# # ============================================================================
+
+# class BookingConfirmedRequest(BaseModel):
+#     appointment_id: str
+#     patient_id: str
+#     doctor_id: str
+#     appointment_datetime: str
+#     duration_minutes: int
+
+
+# class AppointmentCanceledRequest(BaseModel):
+#     appointment_id: str
+#     patient_id: str
+#     doctor_id: str
+#     canceled_by: str
+#     appointment_datetime: str
+
+
+# class FileUploadResponse(BaseModel):
+#     success: bool
+#     url: str
+#     file_key: str
+#     size_bytes: int
+#     message: str
+
+
+# # ============================================================================
+# # FILE UPLOAD — BACKBLAZE B2
+# # ============================================================================
+
+# ALLOWED_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp", "application/pdf"}
+
+# FOLDER_MAP = {
+#     "education_certificate": "doctors/certificates",
+#     "authorization_file":    "doctors/authorizations",
+#     "affiliate_hospital":    "doctors/hospitals",
+#     "id_card":               "doctors/ids",
+#     "profile_photo":         "doctors/photos",
+# }
+
+
+# def resolve_content_type(file: UploadFile) -> str:
+#     """Determine real MIME type — handles Flutter's octet-stream default."""
+#     if file.content_type and file.content_type != "application/octet-stream":
+#         return file.content_type
+#     if file.filename:
+#         guessed, _ = mimetypes.guess_type(file.filename)
+#         if guessed:
+#             print(f"🔍 Guessed MIME from '{file.filename}': {guessed}")
+#             return guessed
+#     return "image/jpeg"
+
+
+# async def upload_to_b2(
+#     file: UploadFile,
+#     user_id: str,
+#     file_type: str,
+#     content_type: str,
+# ) -> Dict[str, Any]:
+#     """
+#     Upload file to Backblaze B2 using boto3 S3-compatible API.
+#     No manual signature generation — boto3 handles everything.
+#     """
+#     contents = await file.read()
+#     file_size = len(contents)
+
+#     folder = FOLDER_MAP.get(file_type, "doctors/documents")
+#     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+#     unique_id = uuid.uuid4().hex[:8]
+
+#     # Determine file extension from content type
+#     ext_map = {
+#         "image/jpeg": ".jpg",
+#         "image/jpg":  ".jpg",
+#         "image/png":  ".png",
+#         "image/webp": ".webp",
+#         "application/pdf": ".pdf",
+#     }
+#     ext = ext_map.get(content_type, ".jpg")
+
+#     # Final key (path) in the bucket
+#     file_key = f"{folder}/{user_id}_{file_type}_{timestamp}_{unique_id}{ext}"
+
+#     print(f"📤 Uploading to B2: {file_key} ({file_size / 1024:.1f}KB) [{content_type}]")
+
+#     # Simple put_object — boto3 handles signing automatically
+#     s3.put_object(
+#         Bucket=B2_BUCKET_NAME,
+#         Key=file_key,
+#         Body=contents,
+#         ContentType=content_type,
+#         # Make file publicly readable
+#         ACL="public-read",
+#     )
+
+#     # Public URL format for Backblaze B2
+#     public_url = f"{B2_ENDPOINT}/{B2_BUCKET_NAME}/{file_key}"
+
+#     print(f"✅ B2 upload OK: {public_url}")
+
+#     return {
+#         "success": True,
+#         "url": public_url,
+#         "file_key": file_key,
+#         "size_bytes": file_size,
+#     }
+
+
+# # ============================================================================
+# # FIREBASE HELPERS
+# # ============================================================================
+
+# async def get_user_data(uid: str) -> Optional[Dict[str, Any]]:
+#     try:
+#         doc = db.collection("users").document(uid).get()
+#         return doc.to_dict() if doc.exists else None
+#     except Exception as e:
+#         print(f"❌ Error fetching user {uid}: {e}")
+#         return None
+
+
+# async def send_fcm_notification(
+#     fcm_token: str, title: str, body: str,
+#     data: Optional[Dict[str, str]] = None
+# ):
+#     if not fcm_token:
+#         return
+#     try:
+#         msg = messaging.Message(
+#             notification=messaging.Notification(title=title, body=body),
+#             data=data or {},
+#             token=fcm_token,
+#         )
+#         messaging.send(msg)
+#         print(f"✅ FCM sent")
+#     except Exception as e:
+#         print(f"❌ FCM failed: {e}")
+
+
+# async def send_email(to_email: str, to_name: str, subject: str, html_content: str):
+#     try:
+#         msg = MIMEMultipart('alternative')
+#         msg['Subject'] = subject
+#         msg['From'] = f"{FROM_NAME} <{SMTP_USER}>"
+#         msg['To'] = to_email
+#         msg.attach(MIMEText(html_content, 'html'))
+#         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+#             server.starttls()
+#             server.login(SMTP_USER, SMTP_PASSWORD)
+#             server.send_message(msg)
+#         print(f"✅ Email sent to {to_email}")
+#     except Exception as e:
+#         print(f"❌ Email failed: {e}")
+
+
+# def format_datetime(iso_string: str) -> str:
+#     try:
+#         dt = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
+#         return dt.strftime("%B %d, %Y at %I:%M %p")
+#     except:
+#         return iso_string
+
+
+# # ============================================================================
+# # EMAIL TEMPLATES
+# # ============================================================================
+
+# def booking_confirmed_email(patient_name: str, doctor_name: str, appointment_time: str) -> str:
+#     return f"""<!DOCTYPE html><html><head><style>
+#         body{{font-family:Arial,sans-serif;line-height:1.6;color:#333}}
+#         .container{{max-width:600px;margin:0 auto;padding:20px}}
+#         .header{{background:#4A90E2;color:white;padding:20px;text-align:center;border-radius:8px 8px 0 0}}
+#         .content{{background:#f9f9f9;padding:30px;border-radius:0 0 8px 8px}}
+#         .info-box{{background:white;padding:15px;margin:20px 0;border-left:4px solid #4A90E2}}
+#         .footer{{text-align:center;padding:20px;color:#666;font-size:12px}}
+#     </style></head><body><div class="container">
+#         <div class="header"><h1>✅ Appointment Confirmed</h1></div>
+#         <div class="content">
+#             <p>Hi {patient_name},</p>
+#             <p>Your telemedicine appointment has been confirmed.</p>
+#             <div class="info-box">
+#                 <p><strong>Doctor:</strong> Dr. {doctor_name}</p>
+#                 <p><strong>Date &amp; Time:</strong> {appointment_time}</p>
+#             </div>
+#             <p>Please be ready a few minutes before the scheduled time.</p>
+#         </div>
+#         <div class="footer"><p>TeleMed - Your Health, Our Priority</p></div>
+#     </div></body></html>"""
+
+
+# def appointment_canceled_email(name: str, doctor_name: str, appointment_time: str, canceled_by: str) -> str:
+#     return f"""<!DOCTYPE html><html><head><style>
+#         body{{font-family:Arial,sans-serif;line-height:1.6;color:#333}}
+#         .container{{max-width:600px;margin:0 auto;padding:20px}}
+#         .header{{background:#E74C3C;color:white;padding:20px;text-align:center;border-radius:8px 8px 0 0}}
+#         .content{{background:#f9f9f9;padding:30px;border-radius:0 0 8px 8px}}
+#         .info-box{{background:white;padding:15px;margin:20px 0;border-left:4px solid #E74C3C}}
+#         .footer{{text-align:center;padding:20px;color:#666;font-size:12px}}
+#     </style></head><body><div class="container">
+#         <div class="header"><h1>❌ Appointment Canceled</h1></div>
+#         <div class="content">
+#             <p>Hi {name},</p>
+#             <p>Your appointment was canceled by the {canceled_by}.</p>
+#             <div class="info-box">
+#                 <p><strong>Doctor:</strong> Dr. {doctor_name}</p>
+#                 <p><strong>Original Date &amp; Time:</strong> {appointment_time}</p>
+#             </div>
+#             <p>You can rebook anytime through the app.</p>
+#         </div>
+#         <div class="footer"><p>TeleMed - Your Health, Our Priority</p></div>
+#     </div></body></html>"""
+
+
+# def reminder_email(name: str, doctor_name: str, appointment_time: str, hours_until: int) -> str:
+#     return f"""<!DOCTYPE html><html><head><style>
+#         body{{font-family:Arial,sans-serif;line-height:1.6;color:#333}}
+#         .container{{max-width:600px;margin:0 auto;padding:20px}}
+#         .header{{background:#F39C12;color:white;padding:20px;text-align:center;border-radius:8px 8px 0 0}}
+#         .content{{background:#f9f9f9;padding:30px;border-radius:0 0 8px 8px}}
+#         .info-box{{background:white;padding:15px;margin:20px 0;border-left:4px solid #F39C12}}
+#         .badge{{background:#F39C12;color:white;padding:10px 20px;border-radius:20px;display:inline-block;margin:20px 0;font-weight:bold}}
+#         .footer{{text-align:center;padding:20px;color:#666;font-size:12px}}
+#     </style></head><body><div class="container">
+#         <div class="header"><h1>⏰ Appointment Reminder</h1></div>
+#         <div class="content">
+#             <p>Hi {name},</p>
+#             <div style="text-align:center"><span class="badge">In {hours_until} hour(s)</span></div>
+#             <div class="info-box">
+#                 <p><strong>Doctor:</strong> Dr. {doctor_name}</p>
+#                 <p><strong>Date &amp; Time:</strong> {appointment_time}</p>
+#             </div>
+#         </div>
+#         <div class="footer"><p>TeleMed - Your Health, Our Priority</p></div>
+#     </div></body></html>"""
+
+
+# # ============================================================================
+# # ENDPOINTS
+# # ============================================================================
+
+# @app.api_route("/", methods=["GET", "HEAD"])
+# async def root():
+#     return {
+#         "status": "healthy",
+#         "service": "TeleMed Backend",
+#         "version": "3.0.0",
+#         "file_storage": "backblaze_b2",
+#         "timestamp": datetime.now(timezone.utc).isoformat()
+#     }
+
+
+# @app.post("/upload-document", response_model=FileUploadResponse)
+# async def upload_document(
+#     file: UploadFile = File(...),
+#     user_id: str = Form(...),
+#     file_type: str = Form(...),
+# ):
+#     try:
+#         content_type = resolve_content_type(file)
+#         print(f"📎 Content type: {content_type} (raw: {file.content_type})")
+
+#         if content_type not in ALLOWED_TYPES:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail=f"File type '{content_type}' not allowed. Use JPG, PNG, WEBP, or PDF."
+#             )
+
+#         # Check size before reading full file
+#         file.file.seek(0, 2)
+#         file_size = file.file.tell()
+#         file.file.seek(0)
+
+#         if file_size > 10 * 1024 * 1024:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail=f"File too large ({file_size / 1024 / 1024:.1f}MB). Max is 10MB."
+#             )
+
+#         result = await upload_to_b2(file, user_id, file_type, content_type)
+
+#         return FileUploadResponse(
+#             success=True,
+#             url=result["url"],
+#             file_key=result["file_key"],
+#             size_bytes=result["size_bytes"],
+#             message="File uploaded successfully"
+#         )
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         print(f"❌ Upload error: {e}")
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @app.post("/booking-confirmed")
+# async def booking_confirmed(request: BookingConfirmedRequest, background_tasks: BackgroundTasks):
+#     try:
+#         patient_data = await get_user_data(request.patient_id)
+#         doctor_data = await get_user_data(request.doctor_id)
+#         if not patient_data or not doctor_data:
+#             raise HTTPException(status_code=404, detail="User not found")
+
+#         patient_name = patient_data.get("displayName") or patient_data.get("firstName", "Patient")
+#         doctor_name = doctor_data.get("displayName") or doctor_data.get("firstName", "Doctor")
+#         apt_time = format_datetime(request.appointment_datetime)
+
+#         if fcm := patient_data.get("fcmToken"):
+#             background_tasks.add_task(send_fcm_notification, fcm,
+#                 "Appointment Confirmed ✅",
+#                 f"Your appointment with Dr. {doctor_name} is confirmed for {apt_time}",
+#                 {"type": "booking_confirmed", "appointment_id": request.appointment_id})
+
+#         if fcm := doctor_data.get("fcmToken"):
+#             background_tasks.add_task(send_fcm_notification, fcm,
+#                 "New Appointment 📅",
+#                 f"New appointment with {patient_name} for {apt_time}",
+#                 {"type": "booking_confirmed", "appointment_id": request.appointment_id})
+
+#         if email := patient_data.get("email"):
+#             background_tasks.add_task(send_email, email, patient_name,
+#                 "Appointment Confirmed",
+#                 booking_confirmed_email(patient_name, doctor_name, apt_time))
+
+#         if email := doctor_data.get("email"):
+#             background_tasks.add_task(send_email, email, doctor_name,
+#                 "New Appointment Scheduled",
+#                 booking_confirmed_email(doctor_name, patient_name, apt_time))
+
+#         return {"success": True, "message": "Notifications sent"}
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @app.post("/appointment-canceled")
+# async def appointment_canceled(request: AppointmentCanceledRequest, background_tasks: BackgroundTasks):
+#     try:
+#         patient_data = await get_user_data(request.patient_id)
+#         doctor_data = await get_user_data(request.doctor_id)
+#         if not patient_data or not doctor_data:
+#             raise HTTPException(status_code=404, detail="User not found")
+
+#         patient_name = patient_data.get("displayName") or patient_data.get("firstName", "Patient")
+#         doctor_name = doctor_data.get("displayName") or doctor_data.get("firstName", "Doctor")
+#         apt_time = format_datetime(request.appointment_datetime)
+
+#         if fcm := patient_data.get("fcmToken"):
+#             background_tasks.add_task(send_fcm_notification, fcm,
+#                 "Appointment Canceled ❌",
+#                 f"Appointment with Dr. {doctor_name} on {apt_time} was canceled",
+#                 {"type": "appointment_canceled", "appointment_id": request.appointment_id})
+
+#         if fcm := doctor_data.get("fcmToken"):
+#             background_tasks.add_task(send_fcm_notification, fcm,
+#                 "Appointment Canceled ❌",
+#                 f"Appointment with {patient_name} on {apt_time} was canceled",
+#                 {"type": "appointment_canceled", "appointment_id": request.appointment_id})
+
+#         if email := patient_data.get("email"):
+#             background_tasks.add_task(send_email, email, patient_name,
+#                 "Appointment Canceled",
+#                 appointment_canceled_email(patient_name, doctor_name, apt_time, request.canceled_by))
+
+#         if email := doctor_data.get("email"):
+#             background_tasks.add_task(send_email, email, doctor_name,
+#                 "Appointment Canceled",
+#                 appointment_canceled_email(doctor_name, patient_name, apt_time, request.canceled_by))
+
+#         return {"success": True, "message": "Cancellation notifications sent"}
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @app.get("/check-reminders")
+# async def check_reminders(background_tasks: BackgroundTasks):
+#     try:
+#         now = datetime.now(timezone.utc)
+#         in_24h = now + timedelta(hours=24)
+#         in_1h = now + timedelta(hours=1)
+
+#         upcoming = (
+#             db.collection("appointments")
+#             .where("status", "==", "confirmed")
+#             .where("appointmentDateTime", ">=", now.isoformat())
+#             .where("appointmentDateTime", "<=", in_24h.isoformat())
+#             .stream()
+#         )
+
+#         reminders_sent = 0
+#         for doc in upcoming:
+#             appointment = doc.to_dict()
+#             try:
+#                 apt_time = datetime.fromisoformat(
+#                     appointment.get("appointmentDateTime").replace('Z', '+00:00'))
+#             except Exception:
+#                 continue
+
+#             last = appointment.get("lastReminderSent")
+#             if now <= apt_time <= in_24h and apt_time > in_1h and not last:
+#                 await send_appointment_reminder(appointment, doc.id, 24, background_tasks)
+#                 reminders_sent += 1
+#             if now <= apt_time <= in_1h and last != "1h":
+#                 await send_appointment_reminder(appointment, doc.id, 1, background_tasks)
+#                 reminders_sent += 1
+
+#         return {"success": True, "reminders_sent": reminders_sent, "checked_at": now.isoformat()}
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# async def send_appointment_reminder(appointment, appointment_id, hours_until, background_tasks):
+#     patient_data = await get_user_data(appointment.get("patientId"))
+#     doctor_data = await get_user_data(appointment.get("doctorId"))
+#     if not patient_data or not doctor_data:
+#         return
+
+#     patient_name = patient_data.get("displayName") or patient_data.get("firstName", "Patient")
+#     doctor_name = doctor_data.get("displayName") or doctor_data.get("firstName", "Doctor")
+#     apt_time = format_datetime(appointment.get("appointmentDateTime"))
+#     title = f"⏰ Appointment in {hours_until}h"
+
+#     if fcm := patient_data.get("fcmToken"):
+#         background_tasks.add_task(send_fcm_notification, fcm, title,
+#             f"Reminder: Appointment with Dr. {doctor_name} at {apt_time}",
+#             {"type": "reminder", "appointment_id": appointment_id})
+#     if email := patient_data.get("email"):
+#         background_tasks.add_task(send_email, email, patient_name,
+#             f"Appointment Reminder - {hours_until}h",
+#             reminder_email(patient_name, doctor_name, apt_time, hours_until))
+#     if fcm := doctor_data.get("fcmToken"):
+#         background_tasks.add_task(send_fcm_notification, fcm, title,
+#             f"Reminder: Appointment with {patient_name} at {apt_time}",
+#             {"type": "reminder", "appointment_id": appointment_id})
+#     if email := doctor_data.get("email"):
+#         background_tasks.add_task(send_email, email, doctor_name,
+#             f"Appointment Reminder - {hours_until}h",
+#             reminder_email(doctor_name, patient_name, apt_time, hours_until))
+
+#     reminder_key = "1h" if hours_until == 1 else "24h"
+#     db.collection("appointments").document(appointment_id).update({"lastReminderSent": reminder_key})
+#     print(f"✅ Reminder sent for {appointment_id} ({hours_until}h)")
+
+
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
 
