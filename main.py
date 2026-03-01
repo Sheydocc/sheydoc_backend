@@ -358,7 +358,7 @@ async def upload_document(
                 detail=f"File type '{content_type}' not allowed. Use JPG, PNG, WEBP, or PDF."
             )
 
-        # Check file size (max 10MB)
+        # Check file size to be (max 10MB)
         file.file.seek(0, 2)
         file_size = file.file.tell()
         file.file.seek(0)
