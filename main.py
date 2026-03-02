@@ -524,7 +524,7 @@ async def booking_confirmed(request: BookingConfirmedRequest, background_tasks: 
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/appointment-canceled")
+@app.post("/appointment-canceled")#
 async def appointment_canceled(request: AppointmentCanceledRequest, background_tasks: BackgroundTasks):
     try:
         patient_data = await get_user_data(request.patient_id)
