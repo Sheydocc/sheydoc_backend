@@ -1,12 +1,18 @@
 """
 TeleMed FastAPI Backend
-Handles notifications, emails, scheduled reminders, AND file uploads via Appwrite
+Handles notifications, emails, scheduled reminders, file uploads via Appwrite,
+and Stream Video token generation.
 """
 
 import os
 import mimetypes
 import smtplib
 import tempfile
+import json
+import base64
+import hmac
+import hashlib
+import time as time_module
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
@@ -36,13 +42,17 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-FROM_NAME = os.getenv("FROM_NAME", "TeleMed App")
+FROM_NAME = os.getenv("FROM_NAME", "SheydocApp")
 
-# Appwrite config — set these in Render environment variables
+# Appwrite config
 APPWRITE_ENDPOINT   = os.getenv("APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1")
-APPWRITE_PROJECT_ID = os.getenv("APPWRITE_PROJECT_ID")   # from Appwrite console
-APPWRITE_API_KEY    = os.getenv("APPWRITE_API_KEY")       # Server API key
-APPWRITE_BUCKET_ID  = os.getenv("APPWRITE_BUCKET_ID")     # Storage bucket ID
+APPWRITE_PROJECT_ID = os.getenv("APPWRITE_PROJECT_ID")
+APPWRITE_API_KEY    = os.getenv("APPWRITE_API_KEY")
+APPWRITE_BUCKET_ID  = os.getenv("APPWRITE_BUCKET_ID")
+
+# Stream Video config — secret NEVER leaves this server
+STREAM_API_KEY    = os.getenv("STREAM_API_KEY")     # nvmcympwmahx
+STREAM_API_SECRET = os.getenv("STREAM_API_SECRET")  # your secret
 
 # Build Appwrite client
 appwrite_client = Client()
@@ -57,9 +67,9 @@ appwrite_storage = Storage(appwrite_client)
 # ============================================================================
 
 app = FastAPI(
-    title="TeleMed Backend",
-    description="Notification, email, and file upload service for TeleMed app",
-    version="3.0.0"
+    title="SheydocApp Backend",
+    description="Notification, email, file upload, and Stream Video token service",
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -96,6 +106,11 @@ class AppointmentCanceledRequest(BaseModel):
     appointment_datetime: str
 
 
+class StreamTokenRequest(BaseModel):
+    user_id: str
+    appointment_id: str
+
+
 class FileUploadResponse(BaseModel):
     success: bool
     url: str
@@ -104,15 +119,51 @@ class FileUploadResponse(BaseModel):
 
 
 # ============================================================================
+# STREAM VIDEO TOKEN GENERATION
+# Pure Python JWT — no extra pip dependency needed.
+# Stream tokens are standard HS256 JWTs signed with your API secret.
+# ============================================================================
+
+def _generate_stream_token(user_id: str) -> str:
+    """
+    Generate a Stream Video user token (JWT HS256).
+    Manually constructed to avoid adding a dependency.
+    """
+    header = {"alg": "HS256", "typ": "JWT"}
+
+    now = int(time_module.time())
+    payload = {
+        "user_id": user_id,
+        "iat": now,
+        "exp": now + (7 * 24 * 60 * 60),  # 7 days validity
+    }
+
+    def b64url_encode(data: dict) -> str:
+        json_str = json.dumps(data, separators=(",", ":"))
+        return base64.urlsafe_b64encode(json_str.encode()).rstrip(b"=").decode()
+
+    header_enc = b64url_encode(header)
+    payload_enc = b64url_encode(payload)
+    signing_input = f"{header_enc}.{payload_enc}"
+
+    signature = hmac.new(
+        STREAM_API_SECRET.encode(),
+        signing_input.encode(),
+        hashlib.sha256,
+    ).digest()
+
+    sig_enc = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
+    return f"{signing_input}.{sig_enc}"
+
+
+# ============================================================================
 # FILE UPLOAD — APPWRITE
-# No signatures, no credentials in requests, just works.
 # ============================================================================
 
 ALLOWED_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp", "application/pdf"}
 
 
 def resolve_content_type(file: UploadFile) -> str:
-    """Detect real MIME type — Flutter sends octet-stream by default."""
     if file.content_type and file.content_type != "application/octet-stream":
         return file.content_type
     if file.filename:
@@ -125,10 +176,6 @@ def resolve_content_type(file: UploadFile) -> str:
 
 
 def build_appwrite_view_url(file_id: str) -> str:
-    """
-    Build a direct public view URL for the uploaded file.
-    Requires the bucket to have 'File Security' disabled OR the file to be public.
-    """
     return (
         f"{APPWRITE_ENDPOINT}/storage/buckets/{APPWRITE_BUCKET_ID}"
         f"/files/{file_id}/view?project={APPWRITE_PROJECT_ID}"
@@ -141,13 +188,8 @@ async def upload_to_appwrite(
     file_type: str,
     content_type: str,
 ) -> Dict[str, Any]:
-    """
-    Upload file to Appwrite Storage.
-    Appwrite requires a real file path (not a stream) so we write to a temp file first.
-    """
     contents = await file.read()
 
-    # Determine extension from content type
     ext_map = {
         "image/jpeg": ".jpg",
         "image/jpg": ".jpg",
@@ -157,17 +199,14 @@ async def upload_to_appwrite(
     }
     ext = ext_map.get(content_type, ".jpg")
 
-    # Write to temp file — Appwrite SDK needs a file path
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(contents)
         tmp_path = tmp.name
 
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Use a meaningful filename so it's identifiable in Appwrite console
         filename = f"{user_id}_{file_type}_{timestamp}{ext}"
 
-        # Upload — ID.unique() generates a unique Appwrite file ID automatically
         result = appwrite_storage.create_file(
             bucket_id=APPWRITE_BUCKET_ID,
             file_id=ID.unique(),
@@ -178,20 +217,13 @@ async def upload_to_appwrite(
         url = build_appwrite_view_url(file_id)
 
         print(f"✅ Appwrite upload OK — file_id: {file_id}")
-        print(f"   URL: {url}")
-
-        return {
-            "success": True,
-            "file_id": file_id,
-            "url": url,
-        }
+        return {"success": True, "file_id": file_id, "url": url}
 
     except Exception as e:
         print(f"❌ Appwrite upload failed: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
     finally:
-        # Always clean up temp file
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
@@ -276,7 +308,7 @@ def booking_confirmed_email(patient_name: str, doctor_name: str, appointment_tim
             </div>
             <p>Please be ready a few minutes before the scheduled time.</p>
         </div>
-        <div class="footer"><p>TeleMed - Your Health, Our Priority</p></div>
+        <div class="footer"><p>Sheydoc - Your Health, Our Priority</p></div>
     </div></body></html>"""
 
 
@@ -299,7 +331,7 @@ def appointment_canceled_email(name: str, doctor_name: str, appointment_time: st
             </div>
             <p>You can rebook anytime through the app.</p>
         </div>
-        <div class="footer"><p>TeleMed - Your Health, Our Priority</p></div>
+        <div class="footer"><p>Sheydoc - Your Health, Our Priority</p></div>
     </div></body></html>"""
 
 
@@ -322,7 +354,7 @@ def reminder_email(name: str, doctor_name: str, appointment_time: str, hours_unt
                 <p><strong>Date &amp; Time:</strong> {appointment_time}</p>
             </div>
         </div>
-        <div class="footer"><p>TeleMed - Your Health, Our Priority</p></div>
+        <div class="footer"><p>Sheydoc - Your Health, Our Priority</p></div>
     </div></body></html>"""
 
 
@@ -334,12 +366,60 @@ def reminder_email(name: str, doctor_name: str, appointment_time: str, hours_unt
 async def root():
     return {
         "status": "healthy",
-        "service": "TeleMed Backend",
-        "version": "3.0.0",
+        "service": "SheydocApp Backend",
+        "version": "4.0.0",
         "file_storage": "appwrite",
+        "video": "stream",
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
+
+# ============================================================================
+# STREAM VIDEO TOKEN ENDPOINT
+# ============================================================================
+
+@app.post("/stream-token")
+async def get_stream_token(request: StreamTokenRequest):
+    """
+    Generate a Stream Video token for a user joining a call.
+    Flutter calls this before joining — the call_id is always the appointment_id.
+    Both doctor and patient use the same appointment_id to join the same call.
+    """
+    try:
+        if not STREAM_API_KEY or not STREAM_API_SECRET:
+            raise HTTPException(
+                status_code=500,
+                detail="Stream credentials not configured on server"
+            )
+
+        # Validate the user exists in Firestore
+        user_data = await get_user_data(request.user_id)
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        token = _generate_stream_token(request.user_id)
+
+        print(f"✅ Stream token generated for user: {request.user_id}")
+        print(f"   Call ID (appointment): {request.appointment_id}")
+
+        return {
+            "success": True,
+            "token": token,
+            "api_key": STREAM_API_KEY,
+            "call_id": request.appointment_id,
+            "user_id": request.user_id,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Stream token error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# FILE UPLOAD ENDPOINT
+# ============================================================================
 
 @app.post("/upload-document", response_model=FileUploadResponse)
 async def upload_document(
@@ -347,7 +427,6 @@ async def upload_document(
     user_id: str = Form(...),
     file_type: str = Form(...),
 ):
-    """Upload a document or image to Appwrite Storage."""
     try:
         content_type = resolve_content_type(file)
         print(f"📎 Content type: {content_type} (raw: {file.content_type})")
@@ -358,7 +437,6 @@ async def upload_document(
                 detail=f"File type '{content_type}' not allowed. Use JPG, PNG, WEBP, or PDF."
             )
 
-        # Check file size (max 10MB)
         file.file.seek(0, 2)
         file_size = file.file.tell()
         file.file.seek(0)
@@ -373,16 +451,12 @@ async def upload_document(
 
         result = await upload_to_appwrite(file, user_id, file_type, content_type)
 
-        # ✅ Persist both the view URL and the Appwrite file_id to Firestore
-        # so the delete endpoint can find and remove files after approval.
-        # Field naming convention:  <file_type>Url  and  <file_type>FileId
-        # e.g. educationCertificateUrl / educationCertificateFileId
         camel_type = (
             file_type.replace("_", " ").title().replace(" ", "")
-        )  # "education_certificate" → "EducationCertificate"
+        )
         firestore_update = {
-            f"{camel_type[0].lower()}{camel_type[1:]}Url": result["url"],        # educationCertificateUrl
-            f"{camel_type[0].lower()}{camel_type[1:]}FileId": result["file_id"], # educationCertificateFileId
+            f"{camel_type[0].lower()}{camel_type[1:]}Url": result["url"],
+            f"{camel_type[0].lower()}{camel_type[1:]}FileId": result["file_id"],
         }
         db.collection("users").document(user_id).set(
             firestore_update, merge=True
@@ -405,35 +479,21 @@ async def upload_document(
 
 @app.delete("/delete-doctor-files/{doctor_id}")
 async def delete_doctor_files(doctor_id: str):
-    """
-    Called after admin approves a doctor.
-    Deletes VERIFICATION files from Appwrite and clears their Firestore fields.
-    
-    ✅ KEEPS: Profile photo (still needed for app display)
-    ❌ DELETES: Education cert, authorization, hospital docs, ID card
-    
-    The doctor's approval status is handled on the Flutter side before calling this.
-    """
-    # ✅ Only verification document file IDs (NOT profile photo)
     file_id_fields = [
         "educationCertificateFileId",
         "authorizationFileFileId",
         "affiliateHospitalFileFileId",
         "idCardFileFileId",
-        # ❌ photoFileId is NOT included - profile photo stays!
     ]
 
-    # ✅ Only verification document URLs (NOT profile photo)
     url_fields = [
         "educationCertificateUrl",
         "authorizationFileUrl",
         "affiliateHospitalFileUrl",
         "idCardFileUrl",
-        # ❌ photoUrl is NOT included - profile photo stays!
     ]
 
     try:
-        # Fetch the doctor's Firestore doc to get file IDs
         doctor_ref = db.collection("users").document(doctor_id)
         doctor_doc = doctor_ref.get()
 
@@ -444,11 +504,10 @@ async def delete_doctor_files(doctor_id: str):
         deleted_files = []
         failed_files = []
 
-        # Delete each verification file from Appwrite
         for field in file_id_fields:
             file_id = doctor_data.get(field)
             if not file_id:
-                continue  # File wasn't uploaded (optional docs)
+                continue
             try:
                 appwrite_storage.delete_file(
                     bucket_id=APPWRITE_BUCKET_ID,
@@ -457,17 +516,11 @@ async def delete_doctor_files(doctor_id: str):
                 deleted_files.append(file_id)
                 print(f"✅ Deleted Appwrite file: {file_id} ({field})")
             except Exception as e:
-                # Don't abort — try to delete the rest
                 failed_files.append(file_id)
                 print(f"⚠️ Could not delete {file_id}: {e}")
 
-        # Clear all verification URL and file ID fields from Firestore
-        # Use DELETE_FIELD sentinel so the keys are removed entirely
         fields_to_clear = {field: firestore.DELETE_FIELD for field in file_id_fields + url_fields}
         doctor_ref.update(fields_to_clear)
-
-        print(f"✅ Cleared verification document fields for doctor {doctor_id}")
-        print(f"✅ Profile photo PRESERVED (photoUrl field not touched)")
 
         return {
             "success": True,
@@ -524,7 +577,7 @@ async def booking_confirmed(request: BookingConfirmedRequest, background_tasks: 
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/appointment-canceled")#
+@app.post("/appointment-canceled")
 async def appointment_canceled(request: AppointmentCanceledRequest, background_tasks: BackgroundTasks):
     try:
         patient_data = await get_user_data(request.patient_id)
@@ -638,6 +691,659 @@ async def send_appointment_reminder(appointment, appointment_id, hours_until, ba
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+
+
+
+
+
+
+
+
+
+
+# """
+# TeleMed FastAPI Backend
+# Handles notifications, emails, scheduled reminders, AND file uploads via Appwrite
+# """
+
+# import os
+# import mimetypes
+# import smtplib
+# import tempfile
+# from email.mime.text import MIMEText
+# from email.mime.multipart import MIMEMultipart
+# from datetime import datetime, timedelta, timezone
+# from typing import Optional, Dict, Any
+# from dotenv import load_dotenv
+
+# from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
+# from fastapi.middleware.cors import CORSMiddleware
+# from pydantic import BaseModel
+
+# import firebase_admin
+# from firebase_admin import credentials, firestore, messaging
+
+# # Appwrite SDK
+# from appwrite.client import Client
+# from appwrite.services.storage import Storage
+# from appwrite.input_file import InputFile
+# from appwrite.id import ID
+
+# load_dotenv()
+
+# # ============================================================================
+# # CONFIG
+# # ============================================================================
+
+# SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+# SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+# SMTP_USER = os.getenv("SMTP_USER")
+# SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+# FROM_NAME = os.getenv("FROM_NAME", "TeleMed App")
+
+# # Appwrite config — set these in Render environment variables
+# APPWRITE_ENDPOINT   = os.getenv("APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1")
+# APPWRITE_PROJECT_ID = os.getenv("APPWRITE_PROJECT_ID")   # from Appwrite console
+# APPWRITE_API_KEY    = os.getenv("APPWRITE_API_KEY")       # Server API key
+# APPWRITE_BUCKET_ID  = os.getenv("APPWRITE_BUCKET_ID")     # Storage bucket ID
+
+# # Build Appwrite client
+# appwrite_client = Client()
+# appwrite_client.set_endpoint(APPWRITE_ENDPOINT)
+# appwrite_client.set_project(APPWRITE_PROJECT_ID)
+# appwrite_client.set_key(APPWRITE_API_KEY)
+
+# appwrite_storage = Storage(appwrite_client)
+
+# # ============================================================================
+# # FASTAPI APP
+# # ============================================================================
+
+# app = FastAPI(
+#     title="TeleMed Backend",
+#     description="Notification, email, and file upload service for TeleMed app",
+#     version="3.0.0"
+# )
+
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+# # Firebase
+# cred = credentials.Certificate(os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH"))
+# firebase_admin.initialize_app(cred)
+# db = firestore.client()
+
+
+# # ============================================================================
+# # PYDANTIC MODELS
+# # ============================================================================
+
+# class BookingConfirmedRequest(BaseModel):
+#     appointment_id: str
+#     patient_id: str
+#     doctor_id: str
+#     appointment_datetime: str
+#     duration_minutes: int
+
+
+# class AppointmentCanceledRequest(BaseModel):
+#     appointment_id: str
+#     patient_id: str
+#     doctor_id: str
+#     canceled_by: str
+#     appointment_datetime: str
+
+
+# class FileUploadResponse(BaseModel):
+#     success: bool
+#     url: str
+#     file_id: str
+#     message: str
+
+
+# # ============================================================================
+# # FILE UPLOAD — APPWRITE
+# # No signatures, no credentials in requests, just works.
+# # ============================================================================
+
+# ALLOWED_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp", "application/pdf"}
+
+
+# def resolve_content_type(file: UploadFile) -> str:
+#     """Detect real MIME type — Flutter sends octet-stream by default."""
+#     if file.content_type and file.content_type != "application/octet-stream":
+#         return file.content_type
+#     if file.filename:
+#         guessed, _ = mimetypes.guess_type(file.filename)
+#         if guessed:
+#             print(f"🔍 Guessed MIME from '{file.filename}': {guessed}")
+#             return guessed
+#     print("⚠️ Defaulting MIME to image/jpeg")
+#     return "image/jpeg"
+
+
+# def build_appwrite_view_url(file_id: str) -> str:
+#     """
+#     Build a direct public view URL for the uploaded file.
+#     Requires the bucket to have 'File Security' disabled OR the file to be public.
+#     """
+#     return (
+#         f"{APPWRITE_ENDPOINT}/storage/buckets/{APPWRITE_BUCKET_ID}"
+#         f"/files/{file_id}/view?project={APPWRITE_PROJECT_ID}"
+#     )
+
+
+# async def upload_to_appwrite(
+#     file: UploadFile,
+#     user_id: str,
+#     file_type: str,
+#     content_type: str,
+# ) -> Dict[str, Any]:
+#     """
+#     Upload file to Appwrite Storage.
+#     Appwrite requires a real file path (not a stream) so we write to a temp file first.
+#     """
+#     contents = await file.read()
+
+#     # Determine extension from content type
+#     ext_map = {
+#         "image/jpeg": ".jpg",
+#         "image/jpg": ".jpg",
+#         "image/png": ".png",
+#         "image/webp": ".webp",
+#         "application/pdf": ".pdf",
+#     }
+#     ext = ext_map.get(content_type, ".jpg")
+
+#     # Write to temp file — Appwrite SDK needs a file path
+#     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+#         tmp.write(contents)
+#         tmp_path = tmp.name
+
+#     try:
+#         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+#         # Use a meaningful filename so it's identifiable in Appwrite console
+#         filename = f"{user_id}_{file_type}_{timestamp}{ext}"
+
+#         # Upload — ID.unique() generates a unique Appwrite file ID automatically
+#         result = appwrite_storage.create_file(
+#             bucket_id=APPWRITE_BUCKET_ID,
+#             file_id=ID.unique(),
+#             file=InputFile.from_path(tmp_path),
+#         )
+
+#         file_id = result['$id']
+#         url = build_appwrite_view_url(file_id)
+
+#         print(f"✅ Appwrite upload OK — file_id: {file_id}")
+#         print(f"   URL: {url}")
+
+#         return {
+#             "success": True,
+#             "file_id": file_id,
+#             "url": url,
+#         }
+
+#     except Exception as e:
+#         print(f"❌ Appwrite upload failed: {e}")
+#         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+#     finally:
+#         # Always clean up temp file
+#         if os.path.exists(tmp_path):
+#             os.remove(tmp_path)
+
+
+# # ============================================================================
+# # FIREBASE / EMAIL HELPERS
+# # ============================================================================
+
+# async def get_user_data(uid: str) -> Optional[Dict[str, Any]]:
+#     try:
+#         doc = db.collection("users").document(uid).get()
+#         return doc.to_dict() if doc.exists else None
+#     except Exception as e:
+#         print(f"❌ Error fetching user {uid}: {e}")
+#         return None
+
+
+# async def send_fcm_notification(
+#     fcm_token: str,
+#     title: str,
+#     body: str,
+#     data: Optional[Dict[str, str]] = None
+# ):
+#     if not fcm_token:
+#         return
+#     try:
+#         msg = messaging.Message(
+#             notification=messaging.Notification(title=title, body=body),
+#             data=data or {},
+#             token=fcm_token,
+#         )
+#         messaging.send(msg)
+#         print(f"✅ FCM sent")
+#     except Exception as e:
+#         print(f"❌ FCM failed: {e}")
+
+
+# async def send_email(to_email: str, to_name: str, subject: str, html_content: str):
+#     try:
+#         msg = MIMEMultipart('alternative')
+#         msg['Subject'] = subject
+#         msg['From'] = f"{FROM_NAME} <{SMTP_USER}>"
+#         msg['To'] = to_email
+#         msg.attach(MIMEText(html_content, 'html'))
+#         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+#             server.starttls()
+#             server.login(SMTP_USER, SMTP_PASSWORD)
+#             server.send_message(msg)
+#         print(f"✅ Email sent to {to_email}")
+#     except Exception as e:
+#         print(f"❌ Email failed: {e}")
+
+
+# def format_datetime(iso_string: str) -> str:
+#     try:
+#         dt = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
+#         return dt.strftime("%B %d, %Y at %I:%M %p")
+#     except:
+#         return iso_string
+
+
+# # ============================================================================
+# # EMAIL TEMPLATES
+# # ============================================================================
+
+# def booking_confirmed_email(patient_name: str, doctor_name: str, appointment_time: str) -> str:
+#     return f"""<!DOCTYPE html><html><head><style>
+#         body{{font-family:Arial,sans-serif;line-height:1.6;color:#333}}
+#         .container{{max-width:600px;margin:0 auto;padding:20px}}
+#         .header{{background:#4A90E2;color:white;padding:20px;text-align:center;border-radius:8px 8px 0 0}}
+#         .content{{background:#f9f9f9;padding:30px;border-radius:0 0 8px 8px}}
+#         .info-box{{background:white;padding:15px;margin:20px 0;border-left:4px solid #4A90E2}}
+#         .footer{{text-align:center;padding:20px;color:#666;font-size:12px}}
+#     </style></head><body><div class="container">
+#         <div class="header"><h1>✅ Appointment Confirmed</h1></div>
+#         <div class="content">
+#             <p>Hi {patient_name},</p>
+#             <p>Your telemedicine appointment has been confirmed.</p>
+#             <div class="info-box">
+#                 <p><strong>Doctor:</strong> Dr. {doctor_name}</p>
+#                 <p><strong>Date &amp; Time:</strong> {appointment_time}</p>
+#             </div>
+#             <p>Please be ready a few minutes before the scheduled time.</p>
+#         </div>
+#         <div class="footer"><p>TeleMed - Your Health, Our Priority</p></div>
+#     </div></body></html>"""
+
+
+# def appointment_canceled_email(name: str, doctor_name: str, appointment_time: str, canceled_by: str) -> str:
+#     return f"""<!DOCTYPE html><html><head><style>
+#         body{{font-family:Arial,sans-serif;line-height:1.6;color:#333}}
+#         .container{{max-width:600px;margin:0 auto;padding:20px}}
+#         .header{{background:#E74C3C;color:white;padding:20px;text-align:center;border-radius:8px 8px 0 0}}
+#         .content{{background:#f9f9f9;padding:30px;border-radius:0 0 8px 8px}}
+#         .info-box{{background:white;padding:15px;margin:20px 0;border-left:4px solid #E74C3C}}
+#         .footer{{text-align:center;padding:20px;color:#666;font-size:12px}}
+#     </style></head><body><div class="container">
+#         <div class="header"><h1>❌ Appointment Canceled</h1></div>
+#         <div class="content">
+#             <p>Hi {name},</p>
+#             <p>Your appointment was canceled by the {canceled_by}.</p>
+#             <div class="info-box">
+#                 <p><strong>Doctor:</strong> Dr. {doctor_name}</p>
+#                 <p><strong>Original Date &amp; Time:</strong> {appointment_time}</p>
+#             </div>
+#             <p>You can rebook anytime through the app.</p>
+#         </div>
+#         <div class="footer"><p>TeleMed - Your Health, Our Priority</p></div>
+#     </div></body></html>"""
+
+
+# def reminder_email(name: str, doctor_name: str, appointment_time: str, hours_until: int) -> str:
+#     return f"""<!DOCTYPE html><html><head><style>
+#         body{{font-family:Arial,sans-serif;line-height:1.6;color:#333}}
+#         .container{{max-width:600px;margin:0 auto;padding:20px}}
+#         .header{{background:#F39C12;color:white;padding:20px;text-align:center;border-radius:8px 8px 0 0}}
+#         .content{{background:#f9f9f9;padding:30px;border-radius:0 0 8px 8px}}
+#         .info-box{{background:white;padding:15px;margin:20px 0;border-left:4px solid #F39C12}}
+#         .badge{{background:#F39C12;color:white;padding:10px 20px;border-radius:20px;display:inline-block;margin:20px 0;font-weight:bold}}
+#         .footer{{text-align:center;padding:20px;color:#666;font-size:12px}}
+#     </style></head><body><div class="container">
+#         <div class="header"><h1>⏰ Appointment Reminder</h1></div>
+#         <div class="content">
+#             <p>Hi {name},</p>
+#             <div style="text-align:center"><span class="badge">In {hours_until} hour(s)</span></div>
+#             <div class="info-box">
+#                 <p><strong>Doctor:</strong> Dr. {doctor_name}</p>
+#                 <p><strong>Date &amp; Time:</strong> {appointment_time}</p>
+#             </div>
+#         </div>
+#         <div class="footer"><p>TeleMed - Your Health, Our Priority</p></div>
+#     </div></body></html>"""
+
+
+# # ============================================================================
+# # ENDPOINTS
+# # ============================================================================
+
+# @app.api_route("/", methods=["GET", "HEAD"])
+# async def root():
+#     return {
+#         "status": "healthy",
+#         "service": "TeleMed Backend",
+#         "version": "3.0.0",
+#         "file_storage": "appwrite",
+#         "timestamp": datetime.now(timezone.utc).isoformat()
+#     }
+
+
+# @app.post("/upload-document", response_model=FileUploadResponse)
+# async def upload_document(
+#     file: UploadFile = File(...),
+#     user_id: str = Form(...),
+#     file_type: str = Form(...),
+# ):
+#     """Upload a document or image to Appwrite Storage."""
+#     try:
+#         content_type = resolve_content_type(file)
+#         print(f"📎 Content type: {content_type} (raw: {file.content_type})")
+
+#         if content_type not in ALLOWED_TYPES:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail=f"File type '{content_type}' not allowed. Use JPG, PNG, WEBP, or PDF."
+#             )
+
+#         # Check file size (max 10MB)
+#         file.file.seek(0, 2)
+#         file_size = file.file.tell()
+#         file.file.seek(0)
+
+#         if file_size > 10 * 1024 * 1024:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail=f"File too large ({file_size / 1024 / 1024:.1f}MB). Max is 10MB."
+#             )
+
+#         print(f"📤 Uploading {file_type} for {user_id}: {file.filename} ({file_size / 1024:.1f}KB)")
+
+#         result = await upload_to_appwrite(file, user_id, file_type, content_type)
+
+#         # ✅ Persist both the view URL and the Appwrite file_id to Firestore
+#         # so the delete endpoint can find and remove files after approval.
+#         # Field naming convention:  <file_type>Url  and  <file_type>FileId
+#         # e.g. educationCertificateUrl / educationCertificateFileId
+#         camel_type = (
+#             file_type.replace("_", " ").title().replace(" ", "")
+#         )  # "education_certificate" → "EducationCertificate"
+#         firestore_update = {
+#             f"{camel_type[0].lower()}{camel_type[1:]}Url": result["url"],        # educationCertificateUrl
+#             f"{camel_type[0].lower()}{camel_type[1:]}FileId": result["file_id"], # educationCertificateFileId
+#         }
+#         db.collection("users").document(user_id).set(
+#             firestore_update, merge=True
+#         )
+#         print(f"✅ Saved to Firestore: {firestore_update}")
+
+#         return FileUploadResponse(
+#             success=True,
+#             url=result['url'],
+#             file_id=result['file_id'],
+#             message="File uploaded successfully"
+#         )
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         print(f"❌ Upload error: {e}")
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @app.delete("/delete-doctor-files/{doctor_id}")
+# async def delete_doctor_files(doctor_id: str):
+#     """
+#     Called after admin approves a doctor.
+#     Deletes VERIFICATION files from Appwrite and clears their Firestore fields.
+    
+#     ✅ KEEPS: Profile photo (still needed for app display)
+#     ❌ DELETES: Education cert, authorization, hospital docs, ID card
+    
+#     The doctor's approval status is handled on the Flutter side before calling this.
+#     """
+#     # ✅ Only verification document file IDs (NOT profile photo)
+#     file_id_fields = [
+#         "educationCertificateFileId",
+#         "authorizationFileFileId",
+#         "affiliateHospitalFileFileId",
+#         "idCardFileFileId",
+#         # ❌ photoFileId is NOT included - profile photo stays!
+#     ]
+
+#     # ✅ Only verification document URLs (NOT profile photo)
+#     url_fields = [
+#         "educationCertificateUrl",
+#         "authorizationFileUrl",
+#         "affiliateHospitalFileUrl",
+#         "idCardFileUrl",
+#         # ❌ photoUrl is NOT included - profile photo stays!
+#     ]
+
+#     try:
+#         # Fetch the doctor's Firestore doc to get file IDs
+#         doctor_ref = db.collection("users").document(doctor_id)
+#         doctor_doc = doctor_ref.get()
+
+#         if not doctor_doc.exists:
+#             raise HTTPException(status_code=404, detail="Doctor not found")
+
+#         doctor_data = doctor_doc.to_dict()
+#         deleted_files = []
+#         failed_files = []
+
+#         # Delete each verification file from Appwrite
+#         for field in file_id_fields:
+#             file_id = doctor_data.get(field)
+#             if not file_id:
+#                 continue  # File wasn't uploaded (optional docs)
+#             try:
+#                 appwrite_storage.delete_file(
+#                     bucket_id=APPWRITE_BUCKET_ID,
+#                     file_id=file_id,
+#                 )
+#                 deleted_files.append(file_id)
+#                 print(f"✅ Deleted Appwrite file: {file_id} ({field})")
+#             except Exception as e:
+#                 # Don't abort — try to delete the rest
+#                 failed_files.append(file_id)
+#                 print(f"⚠️ Could not delete {file_id}: {e}")
+
+#         # Clear all verification URL and file ID fields from Firestore
+#         # Use DELETE_FIELD sentinel so the keys are removed entirely
+#         fields_to_clear = {field: firestore.DELETE_FIELD for field in file_id_fields + url_fields}
+#         doctor_ref.update(fields_to_clear)
+
+#         print(f"✅ Cleared verification document fields for doctor {doctor_id}")
+#         print(f"✅ Profile photo PRESERVED (photoUrl field not touched)")
+
+#         return {
+#             "success": True,
+#             "doctor_id": doctor_id,
+#             "deleted_files": deleted_files,
+#             "failed_files": failed_files,
+#             "message": f"Deleted {len(deleted_files)} verification file(s). Profile photo preserved.",
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         print(f"❌ delete_doctor_files error: {e}")
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @app.post("/booking-confirmed")
+# async def booking_confirmed(request: BookingConfirmedRequest, background_tasks: BackgroundTasks):
+#     try:
+#         patient_data = await get_user_data(request.patient_id)
+#         doctor_data = await get_user_data(request.doctor_id)
+#         if not patient_data or not doctor_data:
+#             raise HTTPException(status_code=404, detail="User not found")
+
+#         patient_name = patient_data.get("displayName") or patient_data.get("firstName", "Patient")
+#         doctor_name = doctor_data.get("displayName") or doctor_data.get("firstName", "Doctor")
+#         apt_time = format_datetime(request.appointment_datetime)
+
+#         if fcm := patient_data.get("fcmToken"):
+#             background_tasks.add_task(send_fcm_notification, fcm,
+#                 "Appointment Confirmed ✅",
+#                 f"Your appointment with Dr. {doctor_name} is confirmed for {apt_time}",
+#                 {"type": "booking_confirmed", "appointment_id": request.appointment_id})
+
+#         if fcm := doctor_data.get("fcmToken"):
+#             background_tasks.add_task(send_fcm_notification, fcm,
+#                 "New Appointment 📅",
+#                 f"New appointment with {patient_name} for {apt_time}",
+#                 {"type": "booking_confirmed", "appointment_id": request.appointment_id})
+
+#         if email := patient_data.get("email"):
+#             background_tasks.add_task(send_email, email, patient_name,
+#                 "Appointment Confirmed",
+#                 booking_confirmed_email(patient_name, doctor_name, apt_time))
+
+#         if email := doctor_data.get("email"):
+#             background_tasks.add_task(send_email, email, doctor_name,
+#                 "New Appointment Scheduled",
+#                 booking_confirmed_email(doctor_name, patient_name, apt_time))
+
+#         return {"success": True, "message": "Notifications sent"}
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @app.post("/appointment-canceled")#sw1
+# async def appointment_canceled(request: AppointmentCanceledRequest, background_tasks: BackgroundTasks):
+#     try:
+#         patient_data = await get_user_data(request.patient_id)
+#         doctor_data = await get_user_data(request.doctor_id)
+#         if not patient_data or not doctor_data:
+#             raise HTTPException(status_code=404, detail="User not found")
+
+#         patient_name = patient_data.get("displayName") or patient_data.get("firstName", "Patient")
+#         doctor_name = doctor_data.get("displayName") or doctor_data.get("firstName", "Doctor")
+#         apt_time = format_datetime(request.appointment_datetime)
+
+#         if fcm := patient_data.get("fcmToken"):
+#             background_tasks.add_task(send_fcm_notification, fcm,
+#                 "Appointment Canceled ❌",
+#                 f"Your appointment with Dr. {doctor_name} on {apt_time} was canceled",
+#                 {"type": "appointment_canceled", "appointment_id": request.appointment_id})
+
+#         if fcm := doctor_data.get("fcmToken"):
+#             background_tasks.add_task(send_fcm_notification, fcm,
+#                 "Appointment Canceled ❌",
+#                 f"Appointment with {patient_name} on {apt_time} was canceled",
+#                 {"type": "appointment_canceled", "appointment_id": request.appointment_id})
+
+#         if email := patient_data.get("email"):
+#             background_tasks.add_task(send_email, email, patient_name,
+#                 "Appointment Canceled",
+#                 appointment_canceled_email(patient_name, doctor_name, apt_time, request.canceled_by))
+
+#         if email := doctor_data.get("email"):
+#             background_tasks.add_task(send_email, email, doctor_name,
+#                 "Appointment Canceled",
+#                 appointment_canceled_email(doctor_name, patient_name, apt_time, request.canceled_by))
+
+#         return {"success": True, "message": "Cancellation notifications sent"}
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @app.get("/check-reminders")
+# async def check_reminders(background_tasks: BackgroundTasks):
+#     try:
+#         now = datetime.now(timezone.utc)
+#         in_24h = now + timedelta(hours=24)
+#         in_1h = now + timedelta(hours=1)
+
+#         upcoming = (
+#             db.collection("appointments")
+#             .where("status", "==", "confirmed")
+#             .where("appointmentDateTime", ">=", now.isoformat())
+#             .where("appointmentDateTime", "<=", in_24h.isoformat())
+#             .stream()
+#         )
+
+#         reminders_sent = 0
+#         for doc in upcoming:
+#             appointment = doc.to_dict()
+#             try:
+#                 apt_time = datetime.fromisoformat(
+#                     appointment.get("appointmentDateTime").replace('Z', '+00:00'))
+#             except Exception:
+#                 continue
+
+#             last = appointment.get("lastReminderSent")
+#             if now <= apt_time <= in_24h and apt_time > in_1h and not last:
+#                 await send_appointment_reminder(appointment, doc.id, 24, background_tasks)
+#                 reminders_sent += 1
+#             if now <= apt_time <= in_1h and last != "1h":
+#                 await send_appointment_reminder(appointment, doc.id, 1, background_tasks)
+#                 reminders_sent += 1
+
+#         return {"success": True, "reminders_sent": reminders_sent, "checked_at": now.isoformat()}
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# async def send_appointment_reminder(appointment, appointment_id, hours_until, background_tasks):
+#     patient_data = await get_user_data(appointment.get("patientId"))
+#     doctor_data = await get_user_data(appointment.get("doctorId"))
+#     if not patient_data or not doctor_data:
+#         return
+
+#     patient_name = patient_data.get("displayName") or patient_data.get("firstName", "Patient")
+#     doctor_name = doctor_data.get("displayName") or doctor_data.get("firstName", "Doctor")
+#     apt_time = format_datetime(appointment.get("appointmentDateTime"))
+#     title = f"⏰ Appointment in {hours_until}h"
+
+#     if fcm := patient_data.get("fcmToken"):
+#         background_tasks.add_task(send_fcm_notification, fcm, title,
+#             f"Reminder: Appointment with Dr. {doctor_name} at {apt_time}",
+#             {"type": "reminder", "appointment_id": appointment_id})
+#     if email := patient_data.get("email"):
+#         background_tasks.add_task(send_email, email, patient_name,
+#             f"Appointment Reminder - {hours_until}h",
+#             reminder_email(patient_name, doctor_name, apt_time, hours_until))
+#     if fcm := doctor_data.get("fcmToken"):
+#         background_tasks.add_task(send_fcm_notification, fcm, title,
+#             f"Reminder: Appointment with {patient_name} at {apt_time}",
+#             {"type": "reminder", "appointment_id": appointment_id})
+#     if email := doctor_data.get("email"):
+#         background_tasks.add_task(send_email, email, doctor_name,
+#             f"Appointment Reminder - {hours_until}h",
+#             reminder_email(doctor_name, patient_name, apt_time, hours_until))
+
+#     reminder_key = "1h" if hours_until == 1 else "24h"
+#     db.collection("appointments").document(appointment_id).update({"lastReminderSent": reminder_key})
+#     print(f"✅ Reminder sent for {appointment_id} ({hours_until}h)")
+
+
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
 
