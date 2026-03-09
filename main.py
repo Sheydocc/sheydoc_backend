@@ -1,7 +1,7 @@
 """
 TeleMed FastAPI Backend v6.1
 Fix: notify_message now logs token lookup results for both sender and recipient,
-     and tries multiple FCM token field names so doctor→patient pushes fire correctly.
+     and tries multiple FCM token field names so doctor→patient pushes fire correctly
 """
 
 import os
