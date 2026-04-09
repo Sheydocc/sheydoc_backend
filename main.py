@@ -33,7 +33,7 @@ from appwrite.id import ID
 
 load_dotenv()
 
-# ============================================================================
+# ===========================================================================
 # CONFIG
 # ============================================================================
 
@@ -250,7 +250,7 @@ async def _upload_to_appwrite(file, bucket_id, content_type, prefix="file"):
     contents = await file.read()
     ext = EXT_MAP.get(content_type, ".bin")
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        tmp.write(contents)
+        tmp.write(contents) 
         tmp_path = tmp.name
     try:
         result = appwrite_storage.create_file(
@@ -547,6 +547,8 @@ async def notify_call_joined(req: NotifyCallJoinedRequest, bg: BackgroundTasks):
         bg.add_task(send_fcm, fcm, "Patient Joined",
                     f"{joiner_name} has joined the call", fcm_data)
     return {"success": True}
+
+
 
 # ── Upload document ───────────────────────────────────────────────────────────
 
