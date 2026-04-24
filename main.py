@@ -40,6 +40,9 @@ from appwrite.services.storage import Storage
 from appwrite.input_file import InputFile
 from appwrite.id import ID
 
+
+
+
 load_dotenv()
 
 # ============================================================================
@@ -76,7 +79,8 @@ app = FastAPI(
     description="Notifications, email, file uploads, Stream Video tokens, Medical Records, Slot Validation",
     version="6.5.0",
 )
-
+from routers.payment import router as payment_router
+app.include_router(payment_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
