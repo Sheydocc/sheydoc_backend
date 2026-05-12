@@ -20,7 +20,7 @@ Auth: every request carries { apiuser, apikey } in HTTP headers.
 No token lifecycle — credentials are static per service.
 
 Phone number format for Fapshi direct-pay:
-  9 digits, no country code — e.g.  "674123456"  NOT "237674123456"
+  9 digits, no country code e.g.  "674123456"  NOT "237674123456"
   The caller (payment.py) is responsible for normalizing the phone
   before passing it here.
 
@@ -108,7 +108,7 @@ async def direct_pay(
     if medium:  payload["medium"] = medium
 
     logger.info(
-        "💳 Fapshi direct-pay: externalId=%s amount=%s XAF phone=%s env=%s",
+        "Fapshi direct-pay: externalId=%s amount=%s XAF phone=%s env=%s",
         external_id, amount, phone, _ENV,
     )
 
