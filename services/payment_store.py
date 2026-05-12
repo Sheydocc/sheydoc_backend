@@ -66,7 +66,7 @@ def create_payment_record(
         "updated_at":          firestore.SERVER_TIMESTAMP,
     })
     logger.info(
-        "📝 Payment record created: ref=%s fapshi_transId=%s",
+        "Payment record created: ref=%s fapshi_transId=%s",
         payment_ref, fapshi_trans_id,
     )
 
@@ -76,7 +76,7 @@ def mark_payment_successful(payment_ref: str) -> None:
         "status":     "successful",
         "updated_at": firestore.SERVER_TIMESTAMP,
     })
-    logger.info("✅ Payment successful: ref=%s", payment_ref)
+    logger.info("Payment successful: ref=%s", payment_ref)
 
 
 def mark_payment_failed(payment_ref: str, reason: str) -> None:
