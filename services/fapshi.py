@@ -141,7 +141,7 @@ async def payment_status(trans_id: str) -> dict:
       {
         "transId":  "ll7J2fl4",
         "status":   "SUCCESSFUL",   # CREATED | PENDING | SUCCESSFUL | FAILED | EXPIRED
-        "amount":   3000,
+        "amount":   100,
         "medium":   "mobile money",
         ...
       }
