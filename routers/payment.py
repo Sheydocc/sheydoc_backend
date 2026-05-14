@@ -65,7 +65,7 @@ router = APIRouter(prefix="/payment", tags=["Payment"])
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 BACKEND_BASE_URL         = os.getenv("BACKEND_BASE_URL", "https://sheydoc-backend.onrender.com")
-APPOINTMENT_FEE_XAF      = int(os.getenv("APPOINTMENT_FEE_XAF", "1"))
+APPOINTMENT_FEE_XAF      = int(os.getenv("APPOINTMENT_FEE_XAF", "100"))
 FAPSHI_WEBHOOK_SECRET    = os.getenv("FAPSHI_WEBHOOK_SECRET", "")   # optional extra check
 
 
