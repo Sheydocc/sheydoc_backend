@@ -245,7 +245,12 @@ ALLOWED_DOC_TYPES  = {"image/jpeg", "image/jpg", "image/png", "image/webp", "app
 ALLOWED_CHAT_TYPES = {
     "image/jpeg", "image/jpg", "image/png", "image/webp", "application/pdf",
     "video/mp4", "video/quicktime", "video/x-matroska",
+    "audio/mp4", "audio/aac", "audio/mpeg", "audio/ogg", "audio/webm",
 }
+# ALLOWED_CHAT_TYPES = {
+#     "image/jpeg", "image/jpg", "image/png", "image/webp", "application/pdf",
+#     "video/mp4", "video/quicktime", "video/x-matroska",
+# }
 EXT_MAP = {
     "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
     "image/webp": ".webp", "application/pdf": ".pdf", "video/mp4": ".mp4",
@@ -1218,7 +1223,8 @@ async def upload_chat_media(
     file.file.seek(0, 2)
     size = file.file.tell()
     file.file.seek(0)
-    max_mb = 50 if media_type == "video" else 10
+    max_mb = 50 if media_type == "video" else 25 if media_type == "audio" else 10
+    # max_mb = 50 if media_type == "video" else 10
     if size > max_mb * 1024 * 1024:
         raise HTTPException(400, f"File too large. Max {max_mb}MB.")
     result = await _upload_to_appwrite(
