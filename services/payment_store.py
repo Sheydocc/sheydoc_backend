@@ -10,7 +10,7 @@ This is the single source of truth for payment state in SheydocApp.
 
 Document schema
 ───────────────
-  payment_ref           str    our unique ref — also the Firestore doc ID
+  payment_ref           str    our unique ref also the Firestore doc ID
   fapshi_trans_id       str    Fapshi's transId (returned by /direct-pay)
   status                str    pending | successful | failed
   amount                int    XAF

@@ -13,7 +13,7 @@ POST /payment/initiate
 
 POST /payment/webhook
     Called by Fapshi servers when the payment changes to SUCCESSFUL,
-    FAILED, or EXPIRED. Idempotent — safe to receive multiple times for
+    FAILED, or EXPIRED. Idempotent safe to receive multiple times for
     the same payment. On SUCCESSFUL: writes the appointment to Firestore
     and sends FCM + email notifications. On FAILED: marks the payment
     record as failed so Flutter shows an error.
@@ -377,7 +377,7 @@ async def _on_payment_success(payment_ref: str) -> None:
         if fcm := _get_fcm_token(patient, payload["patientId"], "patient"):
             await send_fcm(
                 fcm,
-                "Appointment Confirmed ✅",
+                "Appointment Confirmed ",
                 f"Payment received! Your appointment with Dr. {dname} on {atime} is confirmed.",
                 notif_data,
             )

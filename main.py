@@ -546,8 +546,22 @@ def _send_call_fcm(
     caller_id: str,
     invitation_id: Optional[str],
 ) -> None:
-    call_label = "Video" if call_type == "video" else "Audio"
+    """
+    FIX: previously sent TWO messages: a data-only message AND a
+    'display' message containing a `notification` block. Sending both
+    caused Android to auto-render the display message using the
+    DEFAULT system channel/sound (bypassing the custom per-ringtone
+    channel entirely), while the data-only message is what actually
+    triggered the app's own full-screen call UI. The result was either
+    a duplicate notification, the wrong sound, or a plain banner instead
+    of a real full-screen incoming-call alert.
 
+    Sending ONLY a data-only message is the correct pattern for VoIP-
+    style call alerts on Android: it reliably reaches the app's
+    background/foreground handlers, giving the app full control to
+    render the correctly-channeled, correctly-ringtoned, full-screen
+    call UI itself, with nothing else competing with it.
+    """
     fcm_data: Dict[str, str] = {
         "type":           "incoming_call",
         "appointment_id": appointment_id,
@@ -574,36 +588,11 @@ def _send_call_fcm(
         ),
     )
 
-    display = messaging.Message(
-        notification=messaging.Notification(
-            title=f"Incoming {call_label} Call",
-            body=f"{full_caller_name} is calling you",
-        ),
-        data=fcm_data,
-        token=fcm_token,
-        android=messaging.AndroidConfig(
-            priority="high",
-            ttl=60,
-            notification=messaging.AndroidNotification(
-                sound="default",
-                channel_id="sheydoc_calls",
-            ),
-        ),
-        apns=messaging.APNSConfig(
-            headers={"apns-priority": "10"},
-            payload=messaging.APNSPayload(
-                aps=messaging.Aps(sound="default")
-            ),
-        ),
-    )
-
-    for label, msg in [("data-only", data_only), ("display", display)]:
-        try:
-            messaging.send(msg)
-            print(f"✅ Call FCM [{label}] sent → {fcm_token[:20]}...")
-        except Exception as e:
-            print(f"⚠️  Call FCM [{label}] failed (non-fatal): {e}")
-
+    try:
+        messaging.send(data_only)
+        print(f"✅ Call FCM [data-only] sent → {fcm_token[:20]}...")
+    except Exception as e:
+        print(f"⚠️  Call FCM [data-only] failed (non-fatal): {e}")
 
 # ============================================================================
 # REMINDERS
