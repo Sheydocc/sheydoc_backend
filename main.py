@@ -547,7 +547,7 @@ def _send_call_fcm(
     invitation_id: Optional[str],
 ) -> None:
     """
-    FIX: previously sent TWO messages — a data-only message AND a
+    FIX: previously sent TWO messages: a data-only message AND a
     'display' message containing a `notification` block. Sending both
     caused Android to auto-render the display message using the
     DEFAULT system channel/sound (bypassing the custom per-ringtone
